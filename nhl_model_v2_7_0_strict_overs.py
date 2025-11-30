@@ -1,10 +1,11 @@
 import datetime
 import json
+import math
 import urllib.request
 import argparse
 import sys
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from enum import Enum
 
 # --- Data Structures ---
@@ -14,6 +15,110 @@ class Position(Enum):
     WINGER = "W"
     DEFENSEMAN = "D"
     GOALIE = "G"
+
+@dataclass
+class ShotEvent:
+    event_id: int
+    period: int
+    time_in_period: str
+    team_id: int
+    player_id: int
+    x: float
+    y: float
+    shot_type: str 
+    event_type: str 
+    distance: float = 0.0
+    angle: float = 0.0
+    xg: float = 0.0
+
+class AdvancedStatsEngine:
+    """
+    Calculates Advanced Metrics (Corsi, Fenwick, xG) from raw Play-by-Play data.
+    """
+    
+    # Simple xG Model Weights (Logistic Regression Coefficients Proxy)
+    XG_COEFFS = {
+        "intercept": -0.5, 
+        "distance": -0.05, 
+        "angle": -0.02,    
+        "type_bonus": {
+            "slap": 0.1, "snap": 0.2, "wrist": 0.3, 
+            "backhand": 0.2, "tip-in": 0.8, "deflected": 0.6, "wrap-around": 0.4
+        },
+        "rebound_bonus": 0.5 
+    }
+
+    @staticmethod
+    def calculate_distance_angle(x: float, y: float) -> Tuple[float, float]:
+        """Calculates shot distance and angle to the center of the net (89, 0)."""
+        net_x = 89 if x > 0 else -89
+        dx = net_x - x
+        dy = y - 0 
+        distance = math.sqrt(dx**2 + dy**2)
+        if distance == 0: angle = 0
+        else: angle = math.degrees(math.asin(abs(dy) / distance))
+        return distance, angle
+
+    @staticmethod
+    def calculate_xg(shot: ShotEvent) -> float:
+        """Calculates Expected Goal (xG) probability."""
+        coeffs = AdvancedStatsEngine.XG_COEFFS
+        log_odds = coeffs["intercept"]
+        log_odds += coeffs["distance"] * shot.distance
+        log_odds += coeffs["angle"] * shot.angle
+        log_odds += coeffs["type_bonus"].get(shot.shot_type, 0.0)
+        prob = 1 / (1 + math.exp(-log_odds))
+        return min(max(prob, 0.001), 0.95)
+
+    def process_game(self, game_id: str) -> Dict[str, Any]:
+        """Fetches PBP, parses shots, calculates metrics per player and team."""
+        url = f"https://api-web.nhle.com/v1/gamecenter/{game_id}/play-by-play"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        try:
+            with urllib.request.urlopen(req) as response:
+                data = json.loads(response.read().decode())
+        except Exception as e:
+            # print(f"Error fetching PBP for {game_id}: {e}")
+            return {}
+            
+        plays = data.get('plays', [])
+        team_stats = {} 
+        player_stats = {} 
+        
+        for play in plays:
+            type_desc = play.get('typeDescKey')
+            if type_desc not in ['shot-on-goal', 'missed-shot', 'blocked-shot', 'goal']:
+                continue
+                
+            details = play.get('details', {})
+            x = details.get('xCoord')
+            y = details.get('yCoord')
+            if x is None or y is None: continue
+            
+            player_id = details.get('shootingPlayerId', 0)
+            team_id = details.get('eventOwnerTeamId', 0)
+            
+            # Geometry & xG
+            dist, angle = self.calculate_distance_angle(x, y)
+            shot = ShotEvent(
+                event_id=play.get('eventId'), period=play.get('periodDescriptor', {}).get('number', 1),
+                time_in_period=play.get('timeInPeriod'), team_id=team_id, player_id=player_id,
+                x=x, y=y, shot_type=details.get('shotType', 'wrist'), event_type=type_desc,
+                distance=dist, angle=angle
+            )
+            if type_desc != 'blocked-shot': shot.xg = self.calculate_xg(shot)
+            
+            # Init Stats
+            if player_id not in player_stats: player_stats[player_id] = {"CF": 0, "xG": 0.0, "Goals": 0}
+            
+            # Update Stats
+            player_stats[player_id]["CF"] += 1 # Corsi
+            if type_desc != 'blocked-shot':
+                player_stats[player_id]["xG"] += shot.xg
+            if type_desc == 'goal':
+                player_stats[player_id]["Goals"] += 1
+
+        return {"players": player_stats}
 
 @dataclass
 class Player:
@@ -210,55 +315,74 @@ class NHLScheduleFetcher:
 
 class PlayerFormAnalyzer:
     def analyze_form(self, player: Player, reference_date: Optional[datetime.date] = None) -> Dict[str, Any]:
-        """Calculates L5/L10 averages and hit rates. Respects reference_date for backtesting."""
+        """Calculates L5/L10 averages and ADVANCED STATS (xG, Corsi)."""
         fetcher = NHLScheduleFetcher()
+        stats_engine = AdvancedStatsEngine()
         
-        # Determine season based on reference_date or today
         target_date = reference_date if reference_date else datetime.date.today()
-        # Simple season logic: if month > 8, use year + year+1. Else year-1 + year.
-        if target_date.month > 8:
-            season = f"{target_date.year}{target_date.year + 1}"
-        else:
-            season = f"{target_date.year - 1}{target_date.year}"
+        if target_date.month > 8: season = f"{target_date.year}{target_date.year + 1}"
+        else: season = f"{target_date.year - 1}{target_date.year}"
             
         logs = fetcher.fetch_player_game_log(player.id, season)
         
         if not logs:
-            return {"L5_SOG": 0, "L5_Points": 0, "Trend": "Unknown", "Regression_Risk": False}
+            return {"L5_SOG": 0, "L5_Points": 0, "L5_xG": 0.0, "Trend": "Unknown", "Regression_Risk": False}
             
-        # Time Travel: Filter logs to only include games BEFORE the reference date
         if reference_date:
             try:
-                # API dates are YYYY-MM-DD
                 logs = [g for g in logs if datetime.datetime.strptime(g['gameDate'], "%Y-%m-%d").date() < reference_date]
-            except ValueError as e:
-                # print(f"Date parse error: {e}")
-                pass
+            except ValueError: pass
                 
         l5_games = logs[:5]
         
+        # Basic Stats
         l5_sog = sum(g.get('shots', 0) for g in l5_games) / len(l5_games) if l5_games else 0
         l5_points = sum(g.get('points', 0) for g in l5_games) / len(l5_games) if l5_games else 0
+        l5_goals = sum(g.get('goals', 0) for g in l5_games) / len(l5_games) if l5_games else 0
+        
+        # Advanced Stats (xG) - Fetch PBP for last 3 games (Optimization: only 3 deep to save time)
+        l3_xg_total = 0.0
+        l3_games = l5_games[:3]
+        
+        # print(f"    Fetching Advanced Stats for {player.name} (Last 3 Games)...")
+        for g in l3_games:
+            gid = str(g.get('id', ''))
+            if gid:
+                adv_stats = stats_engine.process_game(gid)
+                p_stats = adv_stats.get("players", {}).get(player.id, {"xG": 0.0})
+                l3_xg_total += p_stats["xG"]
+        
+        l3_xg_avg = l3_xg_total / len(l3_games) if l3_games else 0.0
         
         # Trend Detection
         trend = "Neutral"
-        regression_risk = False
         
-        # Heater: > 1.5 PPG in last 5
-        if l5_points >= 1.6: 
-            trend = "Heater"
-            # Regression Trigger: If on heater AND facing Elite Suppression (Logic to be added in Game Analysis)
-            # For now, mark as High Heat
+        # Heater: > 1.5 PPG
+        if l5_points >= 1.6: trend = "Heater"
+        # Cold: < 0.4 PPG
+        if l5_points < 0.4 and player.avg_points > 0.8: trend = "Cold"
         
-        # Cold: < 0.5 PPG in last 5 for a star
-        if l5_points < 0.4 and player.avg_points > 0.8:
-            trend = "Cold"
+        # Regression Flags
+        # Positive Regression: Creating xG but not scoring
+        buy_low = False
+        if l3_xg_avg > 0.5 and l5_goals < 0.2: # Averaging 0.5 xG (good for ~40 goals) but scoring 0
+            buy_low = True
+            trend = "Buy Low (Unlucky)"
             
+        # Negative Regression: Scoring way above xG
+        sell_high = False
+        if l5_goals > 1.0 and l3_xg_avg < 0.3: # Scoring goal/game on low quality
+            sell_high = True
+            trend = "Sell High (Lucky)"
+
         return {
             "L5_SOG": l5_sog,
             "L5_Points": l5_points,
+            "L5_Goals": l5_goals,
+            "L3_xG": l3_xg_avg,
             "Trend": trend,
-            "Regression_Risk": regression_risk # Placeholder for matchup-specific logic
+            "Buy_Low": buy_low,
+            "Sell_High": sell_high
         }
 
 class TeamStatDatabase:
@@ -760,9 +884,17 @@ class NHLModel_v2_5_7:
                  if p.name == "Nathan MacKinnon":
                     picks.append(Pick(game.id, p.name, "SOG", 4.5, "Over", 5, "Usage Spike: Rantanen OUT.", 18.0))
 
-            # Rule: The Heater (General)
+            # Rule: The Heater (General) / Advanced Regression
             if "Heater" in p.status_note or form["Trend"] == "Heater":
                  picks.append(Pick(game.id, p.name, "Points", 1.5, "Over", 4, "The Heater: Hot Streak.", 12.0))
+            
+            # Rule: Buy Low (Advanced Stats)
+            if form.get("Buy_Low", False):
+                 picks.append(Pick(game.id, p.name, "Goals", 0.5, "Over", 4, f"Buy Low Alert: High xG ({form['L3_xG']:.2f}) vs Low Goals. Due.", 16.0))
+                 
+            # Rule: Sell High (Advanced Stats) - Strict Unders
+            if form.get("Sell_High", False) and not green_light_1_5:
+                 picks.append(Pick(game.id, p.name, "Points", 1.5, "Under", 5, f"Regression Fade: Lucky Scoring (High Goals, Low xG {form['L3_xG']:.2f}).", 20.0))
 
         return picks
 
@@ -877,3 +1009,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
