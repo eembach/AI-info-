@@ -1,0 +1,738 @@
+import datetime
+import json
+import math
+import urllib.request
+import argparse
+import sys
+from dataclasses import dataclass, field
+from typing import List, Optional, Dict, Any, Tuple
+from enum import Enum
+
+# --- Data Structures ---
+
+class Position(Enum):
+    CENTER = "C"
+    WINGER = "W"
+    DEFENSEMAN = "D"
+    GOALIE = "G"
+
+@dataclass
+class ShotEvent:
+    event_id: int
+    period: int
+    time_in_period: str
+    team_id: int
+    player_id: int
+    x: float
+    y: float
+    shot_type: str 
+    event_type: str 
+    distance: float = 0.0
+    angle: float = 0.0
+    xg: float = 0.0
+
+class AdvancedStatsEngine:
+    """
+    Calculates Advanced Metrics (Corsi, Fenwick, xG) from raw Play-by-Play data.
+    """
+    
+    # Simple xG Model Weights (Logistic Regression Coefficients Proxy)
+    XG_COEFFS = {
+        "intercept": -0.5, 
+        "distance": -0.05, 
+        "angle": -0.02,    
+        "type_bonus": {
+            "slap": 0.1, "snap": 0.2, "wrist": 0.3, 
+            "backhand": 0.2, "tip-in": 0.8, "deflected": 0.6, "wrap-around": 0.4
+        },
+        "rebound_bonus": 0.5 
+    }
+
+    @staticmethod
+    def calculate_distance_angle(x: float, y: float) -> Tuple[float, float]:
+        """Calculates shot distance and angle to the center of the net (89, 0)."""
+        net_x = 89 if x > 0 else -89
+        dx = net_x - x
+        dy = y - 0 
+        distance = math.sqrt(dx**2 + dy**2)
+        if distance == 0: angle = 0
+        else: angle = math.degrees(math.asin(abs(dy) / distance))
+        return distance, angle
+
+    @staticmethod
+    def calculate_xg(shot: ShotEvent) -> float:
+        """Calculates Expected Goal (xG) probability."""
+        coeffs = AdvancedStatsEngine.XG_COEFFS
+        log_odds = coeffs["intercept"]
+        log_odds += coeffs["distance"] * shot.distance
+        log_odds += coeffs["angle"] * shot.angle
+        log_odds += coeffs["type_bonus"].get(shot.shot_type, 0.0)
+        prob = 1 / (1 + math.exp(-log_odds))
+        return min(max(prob, 0.001), 0.95)
+
+    def process_game(self, game_id: str) -> Dict[str, Any]:
+        """Fetches PBP, parses shots, calculates metrics per player and team."""
+        url = f"https://api-web.nhle.com/v1/gamecenter/{game_id}/play-by-play"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        try:
+            with urllib.request.urlopen(req) as response:
+                data = json.loads(response.read().decode())
+        except Exception as e:
+            # print(f"Error fetching PBP for {game_id}: {e}")
+            return {}
+            
+        plays = data.get('plays', [])
+        player_stats = {} 
+        
+        for play in plays:
+            type_desc = play.get('typeDescKey')
+            if type_desc not in ['shot-on-goal', 'missed-shot', 'blocked-shot', 'goal']:
+                continue
+                
+            details = play.get('details', {})
+            x = details.get('xCoord')
+            y = details.get('yCoord')
+            if x is None or y is None: continue
+            
+            player_id = details.get('shootingPlayerId', 0)
+            team_id = details.get('eventOwnerTeamId', 0)
+            
+            # Geometry & xG
+            dist, angle = self.calculate_distance_angle(x, y)
+            shot = ShotEvent(
+                event_id=play.get('eventId'), period=play.get('periodDescriptor', {}).get('number', 1),
+                time_in_period=play.get('timeInPeriod'), team_id=team_id, player_id=player_id,
+                x=x, y=y, shot_type=details.get('shotType', 'wrist'), event_type=type_desc,
+                distance=dist, angle=angle
+            )
+            if type_desc != 'blocked-shot': shot.xg = self.calculate_xg(shot)
+            
+            # Init Stats
+            if player_id not in player_stats: player_stats[player_id] = {"CF": 0, "xG": 0.0, "Goals": 0}
+            
+            # Update Stats
+            player_stats[player_id]["CF"] += 1 # Corsi
+            if type_desc != 'blocked-shot':
+                player_stats[player_id]["xG"] += shot.xg
+            if type_desc == 'goal':
+                player_stats[player_id]["Goals"] += 1
+
+        return {"players": player_stats}
+
+@dataclass
+class Player:
+    name: str
+    team: str
+    position: Position
+    id: int = 0 # Added Player ID for API calls
+    is_injured: bool = False
+    is_starter: bool = False 
+    avg_sog: float = 2.5
+    avg_points: float = 0.7
+    status_note: str = ""
+    recent_form: Dict[str, Any] = field(default_factory=dict) # L5/L10 stats
+
+@dataclass
+class Team:
+    code: str
+    name: str
+    is_b2b: bool = False
+    # Advanced Stats
+    avg_sog_for: float = 30.0
+    avg_sog_against: float = 30.0
+    goals_for_per_game: float = 3.0
+    goals_against_per_game: float = 3.0
+    pp_pct: float = 20.0 # Placeholder if not available
+    pk_pct: float = 80.0
+    l10_record: str = "5-5-0"
+    streak: str = "None"
+    is_home: bool = False
+    top_center_out: bool = False
+
+@dataclass
+class Game:
+    id: str
+    home_team: Team
+    away_team: Team
+    date: datetime.date
+    time: str
+    home_goalie: Player
+    away_goalie: Player
+    key_players: List[Player]
+
+@dataclass
+class Pick:
+    game_id: str
+    player_name: str
+    market: str # "Saves", "SOG", "Points", "Assists", "Total"
+    line: float
+    side: str # "Over", "Under"
+    confidence: int # 1-5 Stars
+    rationale: str
+    edge: float
+    odds: int = -110 # American Odds (default standard juice)
+    ev: float = 0.0 # Expected Value percentage
+
+class OddsProvider:
+    """
+    Simulates fetching market odds. In a production app, this would query an API (e.g. TheRundown, OddsAPI).
+    """
+    @staticmethod
+    def get_odds(player_name: str, market: str, line: float, side: str) -> int:
+        # Mock Logic to simulate "Juice" on obvious stars
+        stars_juice = {
+            "Connor McDavid": {"Points": -165, "Assists": -140},
+            "Nathan MacKinnon": {"SOG": -150, "Points": -155},
+            "Auston Matthews": {"SOG": -145, "Goals": +110},
+            "David Pastrnak": {"SOG": -140},
+            "Nikita Kucherov": {"Points": -160},
+            "Artemi Panarin": {"Points": -145}
+        }
+        base_odds = -110
+        if player_name in stars_juice:
+            if market in stars_juice[player_name]:
+                return stars_juice[player_name][market]
+            elif market == "SOG" and "SOG" in stars_juice[player_name]:
+                 return stars_juice[player_name]["SOG"]
+        if side == "Under":
+            return -110 
+        return base_odds
+
+class EVCalculator:
+    @staticmethod
+    def american_to_implied(odds: int) -> float:
+        """Converts American Odds to Implied Probability (0.0 - 1.0)."""
+        if odds < 0:
+            return abs(odds) / (abs(odds) + 100)
+        else:
+            return 100 / (odds + 100)
+
+    @staticmethod
+    def calculate_ev(model_prob: float, odds: int) -> float:
+        implied_prob = EVCalculator.american_to_implied(odds)
+        if odds < 0: profit_multiplier = 100 / abs(odds)
+        else: profit_multiplier = odds / 100
+        ev_value = (model_prob * profit_multiplier) - (1 - model_prob)
+        return ev_value * 100 
+
+    @staticmethod
+    def get_model_prob(confidence: int) -> float:
+        """Maps Star Rating to Win Probability."""
+        mapping = {5: 0.65, 4: 0.58, 3: 0.53, 2: 0.48, 1: 0.40}
+        return mapping.get(confidence, 0.50)
+
+class NHLScheduleFetcher:
+    BASE_URL = "https://api-web.nhle.com/v1/schedule"
+    PLAYER_URL = "https://api-web.nhle.com/v1/player"
+
+    def fetch_games(self, date_str: str) -> List[Dict[str, Any]]:
+        url = f"{self.BASE_URL}/{date_str}"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        try:
+            with urllib.request.urlopen(req) as response:
+                if response.status == 200:
+                    data = json.loads(response.read().decode())
+                    game_week = data.get('gameWeek', [])
+                    for day in game_week:
+                        if day['date'] == date_str:
+                            return day.get('games', [])
+            return []
+        except Exception as e:
+            print(f"Error fetching schedule: {e}")
+            return []
+
+    def fetch_player_game_log(self, player_id: int, season: str = "20242025") -> List[Dict[str, Any]]:
+        if player_id == 0: return []
+        url = f"{self.PLAYER_URL}/{player_id}/game-log/{season}/2" 
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        try:
+            with urllib.request.urlopen(req) as response:
+                if response.status == 200:
+                    data = json.loads(response.read().decode())
+                    return data.get('gameLog', [])
+            return []
+        except Exception as e:
+            return []
+
+    def fetch_standings(self) -> Dict[str, Any]:
+        url = "https://api-web.nhle.com/v1/standings/now"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        try:
+            with urllib.request.urlopen(req) as response:
+                if response.status == 200:
+                    return json.loads(response.read().decode())
+            return {}
+        except Exception as e:
+            print(f"Error fetching standings: {e}")
+            return {}
+
+    def fetch_club_stats(self, team_abbr: str) -> Dict[str, Any]:
+        url = f"https://api-web.nhle.com/v1/club-stats/{team_abbr}/now"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        try:
+            with urllib.request.urlopen(req) as response:
+                if response.status == 200:
+                    return json.loads(response.read().decode())
+            return {}
+        except Exception as e:
+            return {}
+
+class PlayerFormAnalyzer:
+    def analyze_form(self, player: Player, reference_date: Optional[datetime.date] = None) -> Dict[str, Any]:
+        """Calculates L5/L10 averages and ADVANCED STATS (xG, Corsi)."""
+        fetcher = NHLScheduleFetcher()
+        stats_engine = AdvancedStatsEngine()
+        
+        target_date = reference_date if reference_date else datetime.date.today()
+        if target_date.month > 8: season = f"{target_date.year}{target_date.year + 1}"
+        else: season = f"{target_date.year - 1}{target_date.year}"
+            
+        logs = fetcher.fetch_player_game_log(player.id, season)
+        
+        if not logs:
+            return {"L5_SOG": 0, "L5_Points": 0, "L5_xG": 0.0, "Trend": "Unknown", "Regression_Risk": False}
+            
+        if reference_date:
+            try:
+                logs = [g for g in logs if datetime.datetime.strptime(g['gameDate'], "%Y-%m-%d").date() < reference_date]
+            except ValueError: pass
+                
+        l5_games = logs[:5]
+        
+        l5_sog = sum(g.get('shots', 0) for g in l5_games) / len(l5_games) if l5_games else 0
+        l5_points = sum(g.get('points', 0) for g in l5_games) / len(l5_games) if l5_games else 0
+        l5_goals = sum(g.get('goals', 0) for g in l5_games) / len(l5_games) if l5_games else 0
+        
+        l3_xg_total = 0.0
+        l3_games = l5_games[:3]
+        
+        for g in l3_games:
+            gid = str(g.get('id', ''))
+            if gid:
+                adv_stats = stats_engine.process_game(gid)
+                p_stats = adv_stats.get("players", {}).get(player.id, {"xG": 0.0})
+                l3_xg_total += p_stats["xG"]
+        
+        l3_xg_avg = l3_xg_total / len(l3_games) if l3_games else 0.0
+        
+        trend = "Neutral"
+        if l5_points >= 1.6: trend = "Heater"
+        if l5_points < 0.4 and player.avg_points > 0.8: trend = "Cold"
+        
+        buy_low = False
+        if l3_xg_avg > 0.5 and l5_goals < 0.2: 
+            buy_low = True
+            trend = "Buy Low (Unlucky)"
+            
+        sell_high = False
+        if l5_goals > 1.0 and l3_xg_avg < 0.3: 
+            sell_high = True
+            trend = "Sell High (Lucky)"
+
+        return {
+            "L5_SOG": l5_sog,
+            "L5_Points": l5_points,
+            "L5_Goals": l5_goals,
+            "L3_xG": l3_xg_avg,
+            "Trend": trend,
+            "Buy_Low": buy_low,
+            "Sell_High": sell_high
+        }
+
+class TeamStatDatabase:
+    _cache = {}
+    _standings_loaded = False
+    
+    @classmethod
+    def _load_standings(cls):
+        if cls._standings_loaded: return
+        fetcher = NHLScheduleFetcher()
+        data = fetcher.fetch_standings()
+        if not data: return
+        
+        for team in data.get('standings', []):
+            code = team.get('teamAbbrev', {}).get('default', '')
+            if not code: continue
+            cls._cache[code] = {
+                "gf": team.get('goalsForPctg', 3.0), 
+                "ga": team.get('goalDifferentialPctg', 0.0) * -1 + team.get('goalsForPctg', 3.0),
+                "raw_gf": team.get('goalFor', 0),
+                "raw_ga": team.get('goalAgainst', 0),
+                "gp": team.get('gamesPlayed', 1),
+                "l10": f"{team.get('l10Wins',0)}-{team.get('l10Losses',0)}-{team.get('l10OtLosses',0)}",
+                "streak": f"{team.get('streakCode','')}{team.get('streakCount',0)}",
+                "sog_for": 0.0, "sog_against": 0.0
+            }
+            gp = cls._cache[code]["gp"]
+            if gp > 0:
+                cls._cache[code]["gf"] = cls._cache[code]["raw_gf"] / gp
+                cls._cache[code]["ga"] = cls._cache[code]["raw_ga"] / gp
+        cls._standings_loaded = True
+
+    @classmethod
+    def _enrich_sog_stats(cls, code: str):
+        if code not in cls._cache: cls._cache[code] = {}
+        if cls._cache[code].get("sog_for", 0) > 0: return 
+        
+        fetcher = NHLScheduleFetcher()
+        data = fetcher.fetch_club_stats(code)
+        if not data: 
+            cls._cache[code]["sog_for"] = 30.0 
+            cls._cache[code]["sog_against"] = 30.0
+            return
+
+        total_shots = sum(s.get('shots', 0) for s in data.get('skaters', []))
+        total_sa = sum(g.get('shotsAgainst', 0) for g in data.get('goalies', []))
+        gp = cls._cache[code].get("gp", 0)
+        if gp == 0:
+            gp = max((s.get('gamesPlayed', 0) for s in data.get('skaters', [])), default=1)
+            
+        if gp > 0:
+            cls._cache[code]["sog_for"] = total_shots / gp
+            cls._cache[code]["sog_against"] = total_sa / gp
+        else:
+            cls._cache[code]["sog_for"] = 30.0
+            cls._cache[code]["sog_against"] = 30.0
+
+    @classmethod
+    def get_team(cls, code: str, name: str = "") -> Team:
+        cls._load_standings()
+        cls._enrich_sog_stats(code)
+        stats = cls._cache.get(code, {
+            "sog_for": 30.0, "sog_against": 30.0, 
+            "gf": 3.0, "ga": 3.0, "l10": "5-5-0", "streak": ""
+        })
+        return Team(
+            code=code, name=name if name else code,
+            avg_sog_for=stats["sog_for"], avg_sog_against=stats["sog_against"],
+            goals_for_per_game=stats["gf"], goals_against_per_game=stats["ga"],
+            l10_record=stats.get("l10", "5-5-0"), streak=stats.get("streak", "")
+        )
+
+class PlayerDatabase:
+    _players = {
+        "COL": [
+            Player("Nathan MacKinnon", "COL", Position.CENTER, avg_sog=4.8, avg_points=1.6, status_note="Elite Volume"),
+            Player("Cale Makar", "COL", Position.DEFENSEMAN, avg_sog=3.2, avg_points=1.2, status_note="Elite D")
+        ],
+        "EDM": [
+            Player("Connor McDavid", "EDM", Position.CENTER, avg_sog=3.5, avg_points=1.8, status_note="Elite Playmaker"),
+            Player("Zach Hyman", "EDM", Position.WINGER, avg_sog=3.8, avg_points=0.9, status_note="Volume Shooter"),
+            Player("Leon Draisaitl", "EDM", Position.CENTER, avg_sog=3.2, avg_points=1.3, status_note="Elite Scorer")
+        ],
+        "TOR": [
+            Player("Auston Matthews", "TOR", Position.CENTER, avg_sog=4.6, avg_points=1.1, status_note="Elite Volume"),
+            Player("William Nylander", "TOR", Position.WINGER, avg_sog=3.8, avg_points=1.0, status_note="Volume Shooter")
+        ],
+        "BOS": [Player("David Pastrnak", "BOS", Position.WINGER, avg_sog=4.5, avg_points=1.2, status_note="Elite Volume")],
+        "TBL": [Player("Nikita Kucherov", "TBL", Position.WINGER, avg_sog=3.5, avg_points=1.6, status_note="Elite Playmaker")],
+        "FLA": [
+            Player("Matthew Tkachuk", "FLA", Position.WINGER, avg_sog=3.6, avg_points=1.1, status_note="Volume Shooter"),
+            Player("Sam Reinhart", "FLA", Position.WINGER, avg_sog=3.2, avg_points=1.0, status_note="Sniper")
+        ],
+        "VGK": [Player("Jack Eichel", "VGK", Position.CENTER, avg_sog=4.2, avg_points=1.1, status_note="Elite Volume")],
+        "NJD": [
+            Player("Jack Hughes", "NJD", Position.CENTER, avg_sog=4.3, avg_points=1.2, status_note="Elite Volume"),
+            Player("Jesper Bratt", "NJD", Position.WINGER, avg_sog=3.0, avg_points=1.0, status_note="Playmaker")
+        ],
+        "CAR": [
+            Player("Sebastian Aho", "CAR", Position.CENTER, avg_sog=3.1, avg_points=1.0, status_note="Volume Shooter"),
+            Player("Martin Necas", "CAR", Position.WINGER, avg_sog=2.8, avg_points=0.9, status_note="Speed")
+        ],
+        "WSH": [Player("Alex Ovechkin", "WSH", Position.WINGER, avg_sog=3.8, avg_points=0.8, status_note="Volume Shooter")],
+        "MIN": [Player("Kirill Kaprizov", "MIN", Position.WINGER, avg_sog=3.6, avg_points=1.3, status_note="Elite Scorer")],
+        "VAN": [
+            Player("Elias Pettersson", "VAN", Position.CENTER, avg_sog=2.8, avg_points=1.0, status_note="Playmaker"),
+            Player("Quinn Hughes", "VAN", Position.DEFENSEMAN, avg_sog=2.5, avg_points=1.1, status_note="Elite D")
+        ],
+        "BUF": [Player("Tage Thompson", "BUF", Position.CENTER, avg_sog=3.9, avg_points=1.0, status_note="Volume Shooter")],
+        "DAL": [Player("Jason Robertson", "DAL", Position.WINGER, avg_sog=3.2, avg_points=1.0, status_note="Volume Shooter")],
+        "OTT": [Player("Brady Tkachuk", "OTT", Position.WINGER, avg_sog=4.2, avg_points=0.9, status_note="Volume Shooter")],
+        "NYR": [Player("Artemi Panarin", "NYR", Position.WINGER, avg_sog=3.5, avg_points=1.4, status_note="Elite Playmaker")],
+        "PIT": [Player("Sidney Crosby", "PIT", Position.CENTER, avg_sog=3.3, avg_points=1.1, status_note="Elite Playmaker")],
+        "LAK": [Player("Adrian Kempe", "LAK", Position.WINGER, avg_sog=3.4, avg_points=0.8, status_note="Volume Shooter")],
+        "NYI": [
+            Player("Bo Horvat", "NYI", Position.CENTER, avg_sog=3.2, avg_points=0.9, status_note="Volume Shooter"),
+            Player("Noah Dobson", "NYI", Position.DEFENSEMAN, avg_sog=2.8, avg_points=0.8, status_note="Elite D"),
+            Player("Kyle Palmieri", "NYI", Position.WINGER, avg_sog=3.0, avg_points=0.7, status_note="Scorer")
+        ],
+        "ANA": [
+            Player("Troy Terry", "ANA", Position.WINGER, avg_sog=2.9, avg_points=0.8, status_note="Scorer"),
+            Player("Frank Vatrano", "ANA", Position.WINGER, avg_sog=3.5, avg_points=0.7, status_note="Volume Shooter")
+        ],
+        "CHI": [Player("Connor Bedard", "CHI", Position.CENTER, avg_sog=3.8, avg_points=1.0, status_note="Elite Volume")],
+        "CGY": [
+            Player("Nazem Kadri", "CGY", Position.CENTER, avg_sog=3.5, avg_points=0.9, status_note="Volume Shooter"),
+            Player("Rasmus Andersson", "CGY", Position.DEFENSEMAN, avg_sog=2.5, avg_points=0.6, status_note="Elite D")
+        ]
+    }
+
+    @classmethod
+    def get_key_players(cls, team_code: str) -> List[Player]:
+        return cls._players.get(team_code, [])
+
+class ScenarioAnalyzer:
+    @staticmethod
+    def analyze_scenario(game: Game) -> Dict[str, Any]:
+        scenarios = []
+        lean = {"total": "Neutral", "side": "Neutral"}
+        
+        if game.home_team.avg_sog_for >= 32.0 and game.away_team.avg_sog_against >= 32.0:
+            scenarios.append("Heavy Siege (Home)")
+            lean["side"] = game.home_team.code
+        if game.away_team.avg_sog_for >= 32.0 and game.home_team.avg_sog_against >= 32.0:
+            scenarios.append("Heavy Siege (Away)")
+            lean["side"] = game.away_team.code
+            
+        proj_total_sog = game.home_team.avg_sog_for + game.away_team.avg_sog_for
+        proj_total_goals = game.home_team.goals_for_per_game + game.away_team.goals_for_per_game
+        
+        if proj_total_sog > 65.0: 
+            scenarios.append("Barnburner (Volume)")
+            lean["total"] = "Over"
+        if proj_total_goals > 6.8: 
+            scenarios.append("Barnburner (Goals)")
+            lean["total"] = "Over"
+        if proj_total_sog < 56.0: 
+            scenarios.append("Trap Game")
+            lean["total"] = "Under"
+        
+        home_diff = game.home_team.goals_for_per_game - game.home_team.goals_against_per_game
+        away_diff = game.away_team.goals_for_per_game - game.away_team.goals_against_per_game
+        
+        if home_diff > 0.5 and away_diff < -0.5: 
+            scenarios.append("Mismatch (Home Fav)")
+            lean["side"] = game.home_team.code
+        if away_diff > 0.5 and home_diff < -0.5: 
+            scenarios.append("Mismatch (Away Fav)")
+            lean["side"] = game.away_team.code
+        
+        return {"tags": scenarios, "lean": lean}
+
+class NHLModel_v3_0_0:
+    def analyze_slate(self, games: List[Game]) -> List[Pick]:
+        picks = []
+        print(f"Running Model v3.0.0 (Advanced Analytics & xG Engine) Analysis for {len(games)} games...")
+        for game in games:
+            game_picks = self._analyze_game(game)
+            picks.extend(game_picks)
+        
+        filtered_picks = []
+        for p in picks:
+            odds = OddsProvider.get_odds(p.player_name, p.market, p.line, p.side)
+            p.odds = odds
+            model_prob = EVCalculator.get_model_prob(p.confidence)
+            ev = EVCalculator.calculate_ev(model_prob, odds)
+            p.ev = ev
+            if odds < -150 and p.confidence < 5: continue
+            if ev > -5.0: filtered_picks.append(p)
+        
+        filtered_picks.sort(key=lambda x: x.ev, reverse=True)
+        return filtered_picks
+
+    def _analyze_game(self, game: Game) -> List[Pick]:
+        picks = []
+        context = ScenarioAnalyzer.analyze_scenario(game)
+        scenarios = context["tags"]
+        lean = context["lean"]
+        
+        if scenarios:
+            print(f"  [{game.id}] Context: {', '.join(scenarios)} | Lean: {lean['side']} / {lean['total']}")
+        
+        picks.extend(self._analyze_saves(game, lean))
+        picks.extend(self._analyze_skaters(game, lean))
+        return picks
+
+    def _analyze_saves(self, game: Game, lean: Dict[str, str]) -> List[Pick]:
+        picks = []
+        proj_sa_home = game.away_team.avg_sog_for + (2.0 if game.away_team.is_b2b is False else -2.0)
+        if game.home_team.is_home: proj_sa_home += 2.0 
+        confidence_boost = 1 if lean["total"] == "Over" else 0
+        
+        if proj_sa_home >= 33.0:
+            rationale = f"Siege Alert: {game.away_team.code} generates volume ({game.away_team.avg_sog_for:.1f}). Projected SA: {proj_sa_home:.1f}."
+            confidence = 4 + confidence_boost
+            if "Rookie" in game.home_goalie.status_note:
+                rationale += " Rookie Volume Lock."
+                confidence = 5
+            elif "Elite" in game.home_goalie.status_note:
+                rationale += " Elite Anchor."
+                confidence = 5
+            picks.append(Pick(game.id, game.home_goalie.name, "Saves", 28.5, "Over", min(confidence, 5), rationale, 15.0))
+
+        proj_sa_away = game.home_team.avg_sog_for + (2.0 if game.home_team.is_b2b is False else -2.0)
+        if game.home_team.is_home: proj_sa_away += 3.0
+        
+        if proj_sa_away >= 33.0:
+             rationale = f"Siege Alert: {game.home_team.code} generates volume ({game.home_team.avg_sog_for:.1f}). Projected SA: {proj_sa_away:.1f}."
+             confidence = 4 + confidence_boost
+             if "Elite" in game.away_goalie.status_note:
+                 confidence = 5
+                 rationale += " Elite Anchor."
+             elif "Rookie" in game.away_goalie.status_note:
+                 confidence = 5
+                 rationale += " Rookie Volume Lock."
+             picks.append(Pick(game.id, game.away_goalie.name, "Saves", 29.5, "Over", min(confidence, 5), rationale, 18.0))
+
+        confidence_boost_under = 1 if lean["total"] == "Under" else 0
+        if game.away_team.avg_sog_for < 26.0:
+            picks.append(Pick(game.id, game.home_goalie.name, "Saves", 26.5, "Under", min(4 + confidence_boost_under, 5), f"Volume Fade: {game.away_team.code} is low event.", 12.0))
+        if game.home_team.avg_sog_for < 26.0:
+            picks.append(Pick(game.id, game.away_goalie.name, "Saves", 26.5, "Under", min(4 + confidence_boost_under, 5), f"Volume Fade: {game.home_team.code} is low event.", 12.0))
+        return picks
+
+    def _analyze_skaters(self, game: Game, lean: Dict[str, str]) -> List[Pick]:
+        picks = []
+        form_analyzer = PlayerFormAnalyzer()
+        context = ScenarioAnalyzer.analyze_scenario(game)
+        scenarios = context["tags"]
+        
+        for p in game.key_players:
+            form = form_analyzer.analyze_form(p, game.date)
+            p.recent_form = form 
+            opponent = game.away_team if p.team == game.home_team.code else game.home_team
+            
+            is_favored_in_mismatch = False
+            if "Mismatch (Home Fav)" in scenarios and p.team == game.home_team.code: is_favored_in_mismatch = True
+            elif "Mismatch (Away Fav)" in scenarios and p.team == game.away_team.code: is_favored_in_mismatch = True
+
+            # --- SOG UNDER LOGIC ---
+            if "Volume" in p.status_note or "Elite" in p.status_note:
+                 is_trap = "Trap Game" in scenarios
+                 is_suppression = opponent.avg_sog_against <= 28.5
+                 if is_suppression or is_trap:
+                     if p.avg_sog >= 3.0: 
+                         confidence = 4
+                         rationale = f"Suppression Fade: {opponent.code} allows {opponent.avg_sog_against:.1f} SOG."
+                         if is_trap:
+                             rationale += " + Trap Game Context."
+                             confidence = 5
+                         picks.append(Pick(game.id, p.name, "SOG", 3.5, "Under", confidence, rationale, 15.0))
+
+            # --- SOG OVER LOGIC ---
+            if "Volume" in p.status_note or "Elite" in p.status_note:
+                if opponent.avg_sog_against >= 31.0:
+                    edge = (p.avg_sog / 2.5) * 10 
+                    rationale_suffix = "."
+                    if form["Trend"] == "Heater": 
+                        edge += 5.0
+                        rationale_suffix = " + HEATER."
+                    elif form["Trend"] == "Cold":
+                        edge -= 5.0
+                        rationale_suffix = " (Cold)."
+                    if is_favored_in_mismatch:
+                        edge -= 3.0
+                        rationale_suffix += " (Blowout Risk)."
+                    picks.append(Pick(game.id, p.name, "SOG", 3.5, "Over", 4, f"Volume Target: {opponent.code} allows {opponent.avg_sog_against:.1f} SOG{rationale_suffix}", edge))
+            
+            # --- POINTS LOGIC ---
+            if "Playmaker" in p.status_note or "Scorer" in p.status_note:
+                threshold_ga = 3.2
+                if lean["total"] == "Over": threshold_ga = 3.0 
+                
+                green_light_1_5 = False
+                if opponent.goals_against_per_game >= 3.4 and form["Trend"] == "Heater": green_light_1_5 = True
+                elif lean["total"] == "Over" and opponent.goals_against_per_game >= 3.2: green_light_1_5 = True
+                elif is_favored_in_mismatch and "Playmaker" in p.status_note: green_light_1_5 = True 
+                
+                if green_light_1_5:
+                    confidence = 5
+                    rationale_suffix = " + Green Light (1.5 Cleared)."
+                    picks.append(Pick(game.id, p.name, "Points", 1.5, "Over", confidence, f"Scoring Target: {opponent.code} allows {opponent.goals_against_per_game:.2f} GA/GP{rationale_suffix}", 12.0))
+                elif opponent.goals_against_per_game >= 2.8: 
+                    if p.avg_points < 1.4: 
+                        picks.append(Pick(game.id, p.name, "Points", 1.5, "Under", 4, f"Fade Alert: 1.5 Line too high for {p.avg_points:.1f} PPG in non-elite spot.", 15.0))
+                    elif form["Trend"] == "Cold":
+                         picks.append(Pick(game.id, p.name, "Points", 1.5, "Under", 5, f"Cold Streak Fade: {p.name} struggling to hit multi-point games.", 18.0))
+
+            if p.name == "Connor McDavid" and "RNH" not in p.status_note: 
+                 if green_light_1_5:
+                    picks.append(Pick(game.id, p.name, "Assists", 1.5, "Over", 5, "Distributor Mode: RNH Returns + Green Light.", 10.0))
+                 else:
+                    picks.append(Pick(game.id, p.name, "Assists", 1.5, "Under", 4, "Fade Distributor: 1.5 Assists requires perfect script.", 12.0))
+
+            if "Heater" in p.status_note or form["Trend"] == "Heater":
+                 picks.append(Pick(game.id, p.name, "Points", 1.5, "Over", 4, "The Heater: Hot Streak.", 12.0))
+            
+            if form.get("Buy_Low", False):
+                 picks.append(Pick(game.id, p.name, "Goals", 0.5, "Over", 4, f"Buy Low Alert: High xG ({form['L3_xG']:.2f}) vs Low Goals. Due.", 16.0))
+                 
+            if form.get("Sell_High", False) and not green_light_1_5:
+                 picks.append(Pick(game.id, p.name, "Points", 1.5, "Under", 5, f"Regression Fade: Lucky Scoring (High Goals, Low xG {form['L3_xG']:.2f}).", 20.0))
+
+        return picks
+
+# --- Main Logic ---
+
+def parse_game_from_api(game_data: Dict[str, Any]) -> Optional[Game]:
+    """Converts API game data to internal Game object."""
+    try:
+        home_abbr = game_data['homeTeam']['abbrev']
+        away_abbr = game_data['awayTeam']['abbrev']
+        
+        home_team = TeamStatDatabase.get_team(home_abbr)
+        away_team = TeamStatDatabase.get_team(away_abbr)
+        
+        home_goalie = Player(f"{home_abbr} Goalie", home_abbr, Position.GOALIE)
+        away_goalie = Player(f"{away_abbr} Goalie", away_abbr, Position.GOALIE)
+        
+        key_players = [] 
+        key_players.extend(PlayerDatabase.get_key_players(home_abbr))
+        key_players.extend(PlayerDatabase.get_key_players(away_abbr))
+        
+        return Game(
+            id=f"{away_abbr}@{home_abbr}",
+            home_team=home_team,
+            away_team=away_team,
+            date=datetime.date.today(), # Placeholder
+            time=game_data.get('startTimeUTC', 'Unknown'),
+            home_goalie=home_goalie,
+            away_goalie=away_goalie,
+            key_players=key_players
+        )
+    except Exception as e:
+        print(f"Error parsing game: {e}")
+        return None
+
+def main():
+    parser = argparse.ArgumentParser(description="NHL Model v3.0.0 - Advanced Analytics Edition")
+    parser.add_argument("--date", type=str, default=datetime.date.today().strftime("%Y-%m-%d"), help="Date to analyze (YYYY-MM-DD)")
+    args = parser.parse_args()
+
+    print(f"Fetching schedule for {args.date}...")
+    fetcher = NHLScheduleFetcher()
+    api_games = fetcher.fetch_games(args.date)
+    
+    if not api_games:
+        print("No games found for this date.")
+        return
+
+    games = []
+    print(f"Found {len(api_games)} games.")
+    print("\n--- Data Enrichment (Optional) ---")
+    print("Press Enter to skip enriching specific game details (Goalies, Injuries).")
+    
+    for ag in api_games:
+        game = parse_game_from_api(ag)
+        if game:
+            print(f"\nMatchup: {game.id}")
+            games.append(game)
+
+    model = NHLModel_v3_0_0()
+    picks = model.analyze_slate(games)
+
+    print("\n🏆 MASTER PICK BOARD (Model v3.0.0 - Advanced Analytics Edition) 🏆")
+    print(f"Date: {args.date}\n")
+    print(f"{'CONF':<6} | {'EV':<6} | {'MATCHUP':<10} | {'PLAYER/TEAM':<20} | {'MARKET':<8} | {'ODDS':<5} | {'RATIONALE'}")
+    print("-" * 110)
+    
+    if not picks:
+        print("No high-value plays found (all picks filtered by EV/Juice).")
+    
+    for pick in picks:
+        stars = "★" * pick.confidence
+        print(f"{stars:<6} | {pick.ev:>5.1f}% | {pick.game_id:<10} | {pick.player_name:<20} | {pick.market:<8} | {pick.odds:<5} | {pick.rationale}")
+
+if __name__ == "__main__":
+    main()
+
