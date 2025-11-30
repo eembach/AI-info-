@@ -650,7 +650,7 @@ class NHLModel_v3_0_0:
                     picks.append(Pick(game.id, p.name, "Assists", 1.5, "Over", 5, "Distributor Mode: RNH Returns + Green Light.", 10.0))
                  else:
                     picks.append(Pick(game.id, p.name, "Assists", 1.5, "Under", 4, "Fade Distributor: 1.5 Assists requires perfect script.", 12.0))
-
+            
             if "Heater" in p.status_note or form["Trend"] == "Heater":
                  picks.append(Pick(game.id, p.name, "Points", 1.5, "Over", 4, "The Heater: Hot Streak.", 12.0))
             
