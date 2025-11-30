@@ -4,6 +4,7 @@ import math
 import urllib.request
 import argparse
 import sys
+import requests
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any, Tuple
 from enum import Enum
@@ -251,6 +252,30 @@ class EVCalculator:
 class NHLScheduleFetcher:
     BASE_URL = "https://api-web.nhle.com/v1/schedule"
     PLAYER_URL = "https://api-web.nhle.com/v1/player"
+
+    def fetch_roster(self, game_id: int) -> Dict[str, List[str]]:
+        """Fetches the live roster for a game to check for key injuries."""
+        try:
+            url = f"https://api-web.nhle.com/v1/gamecenter/{game_id}/boxscore"
+            response = requests.get(url)
+            if response.status_code == 200:
+                data = response.json()
+                roster = {"home": [], "away": []}
+                
+                # Helper to add players
+                def add_players(team_data, key):
+                    for group in ["forwards", "defense", "goalies"]:
+                        for p in team_data.get(group, []):
+                            name_obj = p.get("name", {})
+                            name = name_obj.get("default", "Unknown")
+                            roster[key].append(name)
+                            
+                add_players(data["playerByGameStats"]["homeTeam"], "home")
+                add_players(data["playerByGameStats"]["awayTeam"], "away")
+                return roster
+        except Exception as e:
+            print(f"Error fetching roster for {game_id}: {e}")
+        return {}
 
     def fetch_games(self, date_str: str) -> List[Dict[str, Any]]:
         """Fetches games for a specific date (YYYY-MM-DD)."""
@@ -853,7 +878,18 @@ class NHLModel_v3_0_3:
                  is_trap = "Trap Game" in scenarios or "System Trap" in scenarios
                  is_suppression = opponent.avg_sog_against <= 28.5
                  
-                 if is_suppression or is_trap:
+                 # v3.0.6 TUNE-UP: Efficiency Mismatch / Barnburner OVERRIDE
+                 # If the game is a Barnburner or an Efficiency Mismatch favoring this player, 
+                 # we DO NOT fade their volume, even if the opponent looks like a "Suppression" team.
+                 # Example: COL vs MTL. MTL suppresses shots, but COL Offense >>>> MTL Defense.
+                 is_efficiency_favored = False
+                 if "Efficiency Mismatch (Home)" in scenarios and p.team == game.home_team.code: is_efficiency_favored = True
+                 if "Efficiency Mismatch (Away)" in scenarios and p.team == game.away_team.code: is_efficiency_favored = True
+                 
+                 # Fix: Check for substring because tag is "Barnburner (Goals)"
+                 is_barnburner = any("Barnburner" in s for s in scenarios)
+                 
+                 if (is_suppression or is_trap) and not is_efficiency_favored and not is_barnburner:
                      line = 3.5
                      if p.avg_sog >= 3.0: 
                          confidence = 4
@@ -948,13 +984,24 @@ class NHLModel_v3_0_3:
                     picks.append(Pick(game.id, p.name, "Assists", 1.5, "Under", 4, "Fade Distributor: 1.5 Assists requires perfect script.", 12.0))
 
             # Rule: Usage Vacuum
+            # REFINED v3.0.5: Uses Automated Roster Gate result
             team_obj = game.home_team if p.team == game.home_team.code else game.away_team
             
-            if team_obj.top_center_out and p.position == Position.CENTER and not p.is_injured:
-                picks.append(Pick(game.id, p.name, "SOG", 2.5, "Over", 5, f"Usage Vacuum: Top Center OUT. {p.name} usage spike.", 14.0))
-                continue
-
-            # Rule: Usage Spike
+            if team_obj.top_center_out and not p.is_injured and ("Winger" in p.position.name or "Defense" in p.position.name):
+                # Only boost high-volume players
+                if p.avg_sog > 2.0:
+                    rationale = f"Usage Vacuum: Star Player OUT. {p.name} usage spike."
+                    # If this is a Trap Game, we OVERRIDE the Trap Fade
+                    if "Trap Game" in scenarios:
+                        rationale += " + TRAP OVERRIDE (Vacuum)."
+                        # Clear any previous picks for this player (remove the Under)
+                        # Filter existing picks to remove conflicting Unders for this player
+                        picks = [pick for pick in picks if not (pick.player_name == p.name and pick.type == "Under")]
+                        
+                    picks.append(Pick(game.id, p.name, "SOG", 2.5, "Over", 4, rationale, 14.0))
+                    continue # Skip other checks
+            
+            # Rule: Usage Spike (Legacy Manual Check - Keeping as fallback)
             if "Rantanen OUT" in p.status_note or "Rantanen OUT" in team_obj.name:
                  if p.name == "Nathan MacKinnon":
                     picks.append(Pick(game.id, p.name, "SOG", 4.5, "Over", 5, "Usage Spike: Rantanen OUT.", 18.0))
@@ -1000,6 +1047,61 @@ def parse_game_from_api(game_data: Dict[str, Any], date_str: Optional[str] = Non
         key_players = [] 
         key_players.extend(PlayerDatabase.get_key_players(home_abbr))
         key_players.extend(PlayerDatabase.get_key_players(away_abbr))
+        
+        # --- AUTOMATED ROSTER GATE (v3.0.5) ---
+        # Fetch live roster to check for Scratches/Injuries
+        game_id = game_data.get('id')
+        fetcher = NHLScheduleFetcher()
+        roster = fetcher.fetch_roster(game_id)
+        
+        home_roster = roster.get("home", [])
+        away_roster = roster.get("away", [])
+        
+        # If roster fetch failed (empty), we skip the check to avoid false positives.
+        if home_roster and away_roster:
+            # Check Home Team Top Center
+            home_top_centers = ["Connor McDavid", "Nathan MacKinnon", "Auston Matthews", "Jack Hughes", "Sidney Crosby", "Brayden Point", "Aleksander Barkov", "Elias Pettersson", "Jack Eichel", "Sebastian Aho"]
+            
+            # Identify if Home Team HAS a top center usually
+            for star in home_top_centers:
+                 # Check if this team normally has this player
+                 # Simplified: We check if the star matches the team by looking up in PlayerDatabase (or simple list logic)
+                 pass # Too complex to map all stars to teams here. 
+                 # Better approach: Check if the key_players marked as "Center" and "Elite" are present.
+            
+            # Filter Key Players based on Active Status
+            active_key_players = []
+            for p in key_players:
+                # Determine team roster to check
+                team_roster = home_roster if p.team == home_abbr else away_roster
+                
+                # Loose matching (API name might vary slightly, e.g. "J.T. Miller" vs "J. Miller")
+                # We check if LAST NAME is in the roster string list
+                is_active = False
+                p_lastname = p.name.split(" ")[-1]
+                
+                for roster_name in team_roster:
+                    if p_lastname in roster_name:
+                        is_active = True
+                        break
+                
+                if is_active:
+                    active_key_players.append(p)
+                else:
+                    # Mark as Injured/Scratch
+                    p.is_injured = True
+                    # Check if this triggers Usage Vacuum
+                    if "Elite" in p.status_note or "Center" in p.position.name:
+                        if p.team == home_abbr:
+                            home_team.top_center_out = True # Flag generic vacuum
+                        else:
+                            away_team.top_center_out = True
+                    
+                    # Still include in list but marked injured so we don't pick them?
+                    # No, logic says `if not p.is_injured`
+                    active_key_players.append(p)
+
+            key_players = active_key_players
         
         # Fix Date
         if date_str:
