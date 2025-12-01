@@ -647,11 +647,16 @@ class ScenarioAnalyzer:
         
         # System Trap Detection (Low Event)
         # Threshold: < 58.0 Total SOG (League Avg ~62)
-        if home_vol < 58.0:
+        # Improvement 1: Relative Trap Detection (Identity based)
+        # If a team is fundamentally low event (e.g. sum of avgs < 59), tag it.
+        home_identity = game.home_team.avg_sog_for + game.home_team.avg_sog_against
+        away_identity = game.away_team.avg_sog_for + game.away_team.avg_sog_against
+        
+        if home_vol < 58.0 or home_identity < 59.0:
             scenarios.append("System Trap (Home)")
             if home_vol < 55.0: scenarios.append("System Trap (Lock)")
             
-        if away_vol < 58.0:
+        if away_vol < 58.0 or away_identity < 59.0:
             scenarios.append("System Trap (Away)")
             
         # Suppression Siege Detection (High SF, Low SA)
@@ -853,11 +858,13 @@ class NHLModel_Final:
         confidence_boost = 1 if lean["total"] == "Over" else 0
         
         # Suppression Siege Check (Fade Goalie Saves even if Volume looks ok)
-        if "Suppression Siege (Home)" in scenarios and not skip_saves_under_vs_away:
+        # Improvement 2: Heavy Siege Ban. If opponent generates > 31.5 SOG, DO NOT FADE GOALIE.
+        opponent_vol_home = game.away_team.avg_sog_for
+        if "Suppression Siege (Home)" in scenarios and not skip_saves_under_vs_away and opponent_vol_home < 31.5:
             picks.append(Pick(game.id, game.home_goalie.name, "Saves", 27.5, "Under", 5, f"Suppression Siege: {game.home_team.code} allows very few shots.", 18.0))
 
         # Efficiency Fade (Home Goalie)
-        if "Efficiency Mismatch (Away)" in scenarios and not skip_saves_under_vs_home: # Away Offense is elite vs Home Defense
+        if "Efficiency Mismatch (Away)" in scenarios and not skip_saves_under_vs_home and opponent_vol_home < 31.5: # Away Offense is elite vs Home Defense
              picks.append(Pick(game.id, game.home_goalie.name, "Saves", 28.5, "Under", 5, f"Efficiency Fade: {game.away_team.code} scores goals, limiting saves.", 18.0))
         
         # RECALIBRATED SIEGE THRESHOLD
@@ -893,7 +900,9 @@ class NHLModel_Final:
         if game.away_team.code == "CAR": skip_saves_under_vs_home = True
 
         # Suppression Siege Check (Fade Goalie Saves)
-        if "Suppression Siege (Away)" in scenarios and not skip_saves_under_vs_home:
+        # Improvement 2: Heavy Siege Ban. If opponent generates > 31.5 SOG, DO NOT FADE GOALIE.
+        opponent_vol_away = game.home_team.avg_sog_for
+        if "Suppression Siege (Away)" in scenarios and not skip_saves_under_vs_home and opponent_vol_away < 31.5:
              conf = 5
              if safety_margin_away < 2.0: conf = 4 # Downgrade if projected volume is close to line
              picks.append(Pick(game.id, game.away_goalie.name, "Saves", 27.5, "Under", conf, f"Suppression Siege: {game.away_team.code} allows very few shots.", 18.0))
@@ -909,7 +918,7 @@ class NHLModel_Final:
         # So Saves Under is good? NO. CAR generates VOLUME. Saves Under is BAD.
         # So if Home is CAR, skip_saves_under_vs_away is TRUE.
         # So `if ... and not skip_saves_under_vs_away:` is correct.
-        if "Efficiency Mismatch (Home)" in scenarios and not skip_saves_under_vs_away: 
+        if "Efficiency Mismatch (Home)" in scenarios and not skip_saves_under_vs_away and opponent_vol_away < 31.5: 
              # Check for Blowout Risk (Backup Goalie)
              picks.append(Pick(game.id, game.away_goalie.name, "Saves", 28.5, "Under", 5, f"Efficiency Fade: {game.home_team.code} scores goals, limiting saves.", 18.0))
         
@@ -972,6 +981,9 @@ class NHLModel_Final:
             
             # Determine Opponent
             opponent = game.away_team if p.team == game.home_team.code else game.home_team
+            
+            # Initialize Flags
+            green_light_1_5 = False
             
             # DEFAULT PICK (for Force Mode)
             default_pick = None
@@ -1074,11 +1086,21 @@ class NHLModel_Final:
                 if form["Trend"] == "Heater": proj_pts *= 1.2
                 if is_efficiency_favored: proj_pts *= 1.15
                 
+                # Improvement 3: Cold Team Downgrade
+                # If team is cold (e.g. team.goals_for_per_game < 2.5), don't trust Elites as 5-star
+                # We approximate recent form by team.l10_record or similar, but avg GF/GP is a good proxy.
+                # If the team overall scores < 2.5, it's hard for anyone to get points.
+                team_gf = game.home_team.goals_for_per_game if p.team == game.home_team.code else game.away_team.goals_for_per_game
+                
                 # Threshold for Over 0.5: Need reliable production.
                 # If proj > 0.9, high chance of 1 point.
                 if proj_pts > 0.85:
                     confidence = 5
+                    if team_gf < 2.6: confidence = 4 # Downgrade if team offense is struggling
+                    
                     rationale = f"Safety Valve: {p.name} proj {proj_pts:.2f} pts. Target Over 0.5."
+                    if confidence < 5: rationale += " (Team Offense Cold)."
+                    
                     picks.append(Pick(game.id, p.name, "Points", 0.5, "Over", confidence, rationale, 10.0))
             
             # Points Under 1.5 (Fade Explosion)
