@@ -253,8 +253,8 @@ class NHLScheduleFetcher:
     BASE_URL = "https://api-web.nhle.com/v1/schedule"
     PLAYER_URL = "https://api-web.nhle.com/v1/player"
 
-    def fetch_roster(self, game_id: int) -> Dict[str, List[str]]:
-        """Fetches the live roster for a game to check for key injuries."""
+    def fetch_roster(self, game_id: int) -> Dict[str, List[Dict[str, Any]]]:
+        """Fetches the live roster with stats for a game."""
         try:
             url = f"https://api-web.nhle.com/v1/gamecenter/{game_id}/boxscore"
             response = requests.get(url)
@@ -262,19 +262,33 @@ class NHLScheduleFetcher:
                 data = response.json()
                 roster = {"home": [], "away": []}
                 
+                # Check if boxscore data exists (Future games might be empty)
+                if "playerByGameStats" not in data:
+                    # Fallback: We return empty and handle it in parse_game by fetching club stats directly
+                    return roster
+                
                 # Helper to add players
                 def add_players(team_data, key):
                     for group in ["forwards", "defense", "goalies"]:
                         for p in team_data.get(group, []):
                             name_obj = p.get("name", {})
                             name = name_obj.get("default", "Unknown")
-                            roster[key].append(name)
+                            pid = p.get("playerId", 0)
+                            
+                            player_entry = {
+                                "name": name,
+                                "id": pid,
+                                "position": group, # "forwards", "defense", "goalies"
+                                "sweater": p.get("sweaterNumber", 0)
+                            }
+                            roster[key].append(player_entry)
                             
                 add_players(data["playerByGameStats"]["homeTeam"], "home")
                 add_players(data["playerByGameStats"]["awayTeam"], "away")
                 return roster
         except Exception as e:
-            print(f"Error fetching roster for {game_id}: {e}")
+            # Silent fail or print?
+            pass
         return {}
 
     def fetch_games(self, date_str: str) -> List[Dict[str, Any]]:
@@ -345,17 +359,22 @@ class PlayerFormAnalyzer:
         stats_engine = AdvancedStatsEngine()
         
         target_date = reference_date if reference_date else datetime.date.today()
-        if target_date.month > 8: season = f"{target_date.year}{target_date.year + 1}"
+        # Rule: We are in 2025. Always default to 20252026 if date is post-Aug 2025.
+        if target_date.year == 2025 and target_date.month > 8: season = "20252026"
+        elif target_date.month > 8: season = f"{target_date.year}{target_date.year + 1}"
         else: season = f"{target_date.year - 1}{target_date.year}"
             
         logs = fetcher.fetch_player_game_log(player.id, season)
         
+        # --- Strict Availability Check (Prop Simulation) ---
+        # If player has no logs in current season, assume Inactive/No Props
         if not logs:
             return {
                 "L5_SOG": 0, "L5_Points": 0, "L5_Goals": 0, 
-                "L3_xG": 0.0, "Trend": "Unknown", "SOG_Trend": "Unknown",
+                "L3_xG": 0.0, "Trend": "Inactive", "SOG_Trend": "Inactive",
                 "Buy_Low": False, "Sell_High": False,
-                "Consistency_Points": 0.0, "Consistency_SOG": 0.0
+                "Consistency_Points": 0.0, "Consistency_SOG": 0.0,
+                "Days_Since_Last": 999
             }
             
         if reference_date:
@@ -363,6 +382,12 @@ class PlayerFormAnalyzer:
                 logs = [g for g in logs if datetime.datetime.strptime(g['gameDate'], "%Y-%m-%d").date() < reference_date]
             except ValueError: pass
                 
+        # Recency Gate: Check days since last game
+        days_since_last = 0
+        if logs:
+            last_game_date = datetime.datetime.strptime(logs[0]['gameDate'], "%Y-%m-%d").date()
+            days_since_last = (target_date - last_game_date).days
+            
         l5_games = logs[:5]
         l20_games = logs[:20] # For consistency check
         
@@ -370,6 +395,17 @@ class PlayerFormAnalyzer:
         l5_sog = sum(g.get('shots', 0) for g in l5_games) / len(l5_games) if l5_games else 0
         l5_points = sum(g.get('points', 0) for g in l5_games) / len(l5_games) if l5_games else 0
         l5_goals = sum(g.get('goals', 0) for g in l5_games) / len(l5_games) if l5_games else 0
+        l5_assists = sum(g.get('assists', 0) for g in l5_games) / len(l5_games) if l5_games else 0
+        
+        # v3.3.0 RED TEAM: Goal Share (Playmaker Trap)
+        # Calculate % of points that are goals (vs assists)
+        goal_share = 0.0
+        if l5_points > 0:
+            goal_share = l5_goals / l5_points
+        elif player.avg_points > 0:
+            # Fallback to season average if L5 is empty
+            # Estimate: if avg_points > 0, assume reasonable goal share
+            goal_share = 0.4  # Default 40% goal share
         
         # Consistency Check (Critique 2 Improvement)
         # Calculate Hit Rate % over L20 games
@@ -378,6 +414,11 @@ class PlayerFormAnalyzer:
         
         hits_sog_3 = sum(1 for g in l20_games if g.get('shots', 0) >= 3)
         consistency_sog = hits_sog_3 / len(l20_games) if l20_games else 0.0
+        
+        # Hit Rate for Under 1.5 Points (Depth Fade)
+        # We want % of games with 0 or 1 point.
+        hits_under_1_5 = sum(1 for g in l20_games if g.get('points', 0) < 1.5)
+        hit_rate_under_1_5 = hits_under_1_5 / len(l20_games) if l20_games else 0.0
         
         # Advanced Stats (xG) - Fetch PBP for last 3 games (Optimization: only 3 deep to save time)
         l3_xg_total = 0.0
@@ -423,13 +464,17 @@ class PlayerFormAnalyzer:
             "L5_SOG": l5_sog,
             "L5_Points": l5_points,
             "L5_Goals": l5_goals,
+            "L5_Assists": l5_assists,
             "L3_xG": l3_xg_avg,
             "Trend": trend,
             "SOG_Trend": sog_trend,
             "Buy_Low": buy_low,
             "Sell_High": sell_high,
             "Consistency_Points": consistency_points,
-            "Consistency_SOG": consistency_sog
+            "Consistency_SOG": consistency_sog,
+            "hit_rate_l20_points_under_1_5": hit_rate_under_1_5,
+            "goal_share": goal_share,
+            "Days_Since_Last": days_since_last
         }
 
 class TeamStatDatabase:
@@ -652,6 +697,34 @@ class ScenarioAnalyzer:
     SUPPRESSION_SIEGE_TEAMS = []
 
     @staticmethod
+    def estimate_game_script(game: Game) -> Dict[str, Any]:
+        """
+        v3.3.0 RED TEAM: Score Effects & Game Script Analysis
+        Estimates favorite/underdog status and close game probability for Score Effects.
+        """
+        home_diff = game.home_team.goals_for_per_game - game.home_team.goals_against_per_game
+        away_diff = game.away_team.goals_for_per_game - game.away_team.goals_against_per_game
+        
+        # Simple favorite detection (can be enhanced with ML odds if available)
+        home_is_favorite = home_diff > away_diff + 0.3
+        away_is_favorite = away_diff > home_diff + 0.3
+        is_close_game = abs(home_diff - away_diff) < 0.3
+        
+        # Empty Net Probability (Close games = Higher EN chance)
+        en_probability = 0.0
+        if is_close_game:
+            en_probability = 0.35  # 35% chance of EN situation in close games
+        elif abs(home_diff - away_diff) > 0.8:
+            en_probability = 0.15  # Blowouts rarely have EN
+        
+        return {
+            "home_is_favorite": home_is_favorite,
+            "away_is_favorite": away_is_favorite,
+            "is_close_game": is_close_game,
+            "en_probability": en_probability
+        }
+
+    @staticmethod
     def analyze_scenario(game: Game) -> Dict[str, Any]:
         scenarios = []
         lean = {"total": "Neutral", "side": "Neutral"}
@@ -668,12 +741,25 @@ class ScenarioAnalyzer:
         home_identity = game.home_team.avg_sog_for + game.home_team.avg_sog_against
         away_identity = game.away_team.avg_sog_for + game.away_team.avg_sog_against
         
+        # v3.3.2: Calculate shooting percentages for Efficiency Trap detection
+        home_shooting_pct = (game.home_team.goals_for_per_game / game.home_team.avg_sog_for * 100) if game.home_team.avg_sog_for > 0 else 0
+        away_shooting_pct = (game.away_team.goals_for_per_game / game.away_team.avg_sog_for * 100) if game.away_team.avg_sog_for > 0 else 0
+        
+        # Volume-based System Trap (Low SOG)
         if home_vol < 58.0 or home_identity < 59.0:
-            scenarios.append("System Trap (Home)")
+            # Check if it's an Efficiency Trap (low volume but high shooting %)
+            if home_shooting_pct > 11.0 and game.home_team.avg_sog_for < 28.0:
+                scenarios.append("Efficiency Trap (Home)")  # Low volume, high efficiency
+            else:
+                scenarios.append("System Trap (Home)")  # True low-event team
             if home_vol < 55.0: scenarios.append("System Trap (Lock)")
             
         if away_vol < 58.0 or away_identity < 59.0:
-            scenarios.append("System Trap (Away)")
+            # Check if it's an Efficiency Trap
+            if away_shooting_pct > 11.0 and game.away_team.avg_sog_for < 28.0:
+                scenarios.append("Efficiency Trap (Away)")
+            else:
+                scenarios.append("System Trap (Away)")
             
         # Suppression Siege Detection (High SF, Low SA)
         # Criteria: SF > 32 AND SA < 28
@@ -693,16 +779,23 @@ class ScenarioAnalyzer:
         # --- 2. Game Context ---
         
         # Trap Game Logic (Dynamic)
+        # v3.3.2: Distinguish between Volume Trap and Efficiency Trap
         is_trap_game = False
-        if "System Trap (Home)" in scenarios or "System Trap (Away)" in scenarios:
+        is_volume_trap = "System Trap (Home)" in scenarios or "System Trap (Away)" in scenarios
+        is_efficiency_trap_only = ("Efficiency Trap (Home)" in scenarios or "Efficiency Trap (Away)" in scenarios) and not is_volume_trap
+        
+        if is_volume_trap:
             is_trap_game = True
-            lean["total"] = "Under"
+            lean["total"] = "Under"  # Volume traps = Under
+        elif is_efficiency_trap_only:
+            is_trap_game = True
+            # Efficiency traps can go Over (high shooting %), so don't set Under lean
             
         # Volatility Check: If Home Team is high pace but Away is Trap, it's a "Clash"
         # If Home Team is Trap, they dictate pace more.
-        if "System Trap (Home)" in scenarios:
+        if "System Trap (Home)" in scenarios or "Efficiency Trap (Home)" in scenarios:
             is_trap_game = True # Home trap usually wins out
-        elif "System Trap (Away)" in scenarios and "Pace Matchup" not in scenarios:
+        elif ("System Trap (Away)" in scenarios or "Efficiency Trap (Away)" in scenarios) and "Pace Matchup" not in scenarios:
              # Away trap can drag a neutral team down
              if home_vol < 62.0: is_trap_game = True
              
@@ -722,18 +815,30 @@ class ScenarioAnalyzer:
         proj_total_sog = game.home_team.avg_sog_for + game.away_team.avg_sog_for
         proj_total_goals = game.home_team.goals_for_per_game + game.away_team.goals_for_per_game
         
+        # v3.3.2: Conflict Resolution - Can't be both System Trap and Barnburner
+        # If it's an Efficiency Trap, it can still be a Barnburner (Goals) due to high shooting %
+        is_efficiency_trap = "Efficiency Trap" in str(scenarios)
+        is_volume_trap = "System Trap" in str(scenarios) and not is_efficiency_trap
+        
         if proj_total_sog > 64.0 or (proj_total_sog > 60.0 and "Pace Matchup" in scenarios): 
-            scenarios.append("Barnburner (Volume)")
-            lean["total"] = "Over"
+            if not is_volume_trap:  # Don't add if it's a true volume trap
+                scenarios.append("Barnburner (Volume)")
+                lean["total"] = "Over"
+        
         if proj_total_goals > 6.6: 
+            # Efficiency Trap games can still be Barnburner (Goals) - high shooting % despite low volume
             scenarios.append("Barnburner (Goals)")
-            lean["total"] = "Over"
+            if not is_volume_trap:  # Only set Over lean if not a volume trap
+                lean["total"] = "Over"
         
         # 4. Trap Game (Statistical)
+        # v3.3.2: Refined logic - Efficiency Trap doesn't necessarily mean Under
         if (proj_total_sog < 56.0 or is_trap_game) and "System Trap (Soft)" not in scenarios: 
             if "Barnburner (Volume)" not in scenarios:
                 if "Trap Game" not in scenarios: scenarios.append("Trap Game")
-                lean["total"] = "Under"
+                # Only set Under lean for true volume traps, not efficiency traps
+                if is_volume_trap and not is_efficiency_trap:
+                    lean["total"] = "Under"
         
         # 5. Mismatch & Efficiency
         home_diff = game.home_team.goals_for_per_game - game.home_team.goals_against_per_game
@@ -766,7 +871,7 @@ class NHLModel_Final:
 
     def analyze_slate(self, games: List[Game]) -> List[Pick]:
         picks = []
-        print(f"Running Model v3.1.3 (Restored Hybrid + Fixed) Analysis for {len(games)} games...")
+        print(f"Running Model v3.3.2 (System Trap Refinement) Analysis for {len(games)} games...")
         for game in games:
             # v3.1.3: ENABLE FORCE MODE to ensure picking logic is active if no strong play found
             game_picks = self._analyze_game(game)
@@ -778,6 +883,14 @@ class NHLModel_Final:
             # Get Odds
             odds = OddsProvider.get_odds(p.player_name, p.market, p.line, p.side)
             p.odds = odds
+            
+            # v3.2.6 ODDS GATE (Points Under 1.5)
+            # If we are betting Under 1.5 Points (Ceiling Fade), the odds must be decent.
+            # We don't want to pay -200 juice for a prop that hits 70% of the time.
+            # Threshold: If odds < -170 (e.g. -200), we skip.
+            if p.market == "Points" and p.line == 1.5 and p.side == "Under":
+                if odds < -170:
+                    continue
             
             # Calc EV
             model_prob = EVCalculator.get_model_prob(p.confidence)
@@ -831,30 +944,30 @@ class NHLModel_Final:
     def _analyze_game(self, game: Game) -> List[Pick]:
         picks = []
         
-        # Advanced Scenario Analysis
+        # Advanced Scenario Analysis (Calculate once, reuse)
         context = ScenarioAnalyzer.analyze_scenario(game)
         scenarios = context["tags"]
         lean = context["lean"]
+        game_script = ScenarioAnalyzer.estimate_game_script(game)  # v3.3.0: Calculate once
         
         if scenarios:
             print(f"  [{game.id}] Context: {', '.join(scenarios)} | Lean: {lean['side']} / {lean['total']}")
         
         # 1. Saves Analysis
-        picks.extend(self._analyze_saves(game, lean))
+        picks.extend(self._analyze_saves(game, lean, context, game_script))
         
         # 2. Skater Volume/Points Analysis
         # Force All enabled to ensure volume
-        picks.extend(self._analyze_skaters(game, lean, force_all=True))
+        picks.extend(self._analyze_skaters(game, lean, context, force_all=True))
         
         return picks
 
     # --- Specific Rule Implementations ---
 
-    def _analyze_saves(self, game: Game, lean: Dict[str, str]) -> List[Pick]:
+    def _analyze_saves(self, game: Game, lean: Dict[str, str], context: Dict[str, Any], game_script: Dict[str, Any]) -> List[Pick]:
         picks = []
         
-        # Helper: Get updated scenarios locally if needed
-        context = ScenarioAnalyzer.analyze_scenario(game)
+        # Use pre-calculated context (optimization: avoid redundant API calls)
         scenarios = context["tags"]
         
         # Rule: Elite Siege Anchor / Rookie Siege
@@ -866,26 +979,45 @@ class NHLModel_Final:
         if game.home_team.code == "CAR": skip_saves_under_vs_away = True
         if game.away_team.code == "CAR": skip_saves_under_vs_home = True
 
+        # v3.2.3 HOTFIX: POROUS DEFENSE BAN
+        # If a team has a terrible defense (GA/GP > 3.35), they give up free volume.
+        # Do not take Saves Unders on their goalies, even if the opponent is low-event.
+        # (Fixes SJS Goalie loss where SJS allowed 39 shots to low-event SEA)
+        home_defense_porous = game.home_team.goals_against_per_game > 3.35
+        away_defense_porous = game.away_team.goals_against_per_game > 3.35
+
+        # v3.3.0 RED TEAM: Score Effects Modifier (pre-calculated)
+        
         # Check Home Goalie (vs Away Volume)
         proj_sa_home = game.away_team.avg_sog_for + (2.0 if game.away_team.is_b2b is False else -2.0)
         if game.home_team.is_home: proj_sa_home += 2.0 # Home bias
         
-        # Boost confidence if Total Lean is Over or Game is High Event
-        confidence_boost = 1 if lean["total"] == "Over" else 0
+        # Score Effects: If Away is Favorite, they may turtle (reduce shots)
+        if game_script["away_is_favorite"]:
+            proj_sa_home *= 0.95  # 5% reduction (favorite turtle effect)
+        elif game_script["home_is_favorite"]:
+            # Home is favorite, away is underdog - away presses more
+            proj_sa_home *= 1.05  # 5% increase (underdog press effect)
+        
+        # Empty Net Variance: Close games have EN situations (goalie out = no saves)
+        if game_script["is_close_game"]:
+            # Reduce projected saves by EN probability * average EN time (2 min)
+            en_time_factor = game_script["en_probability"] * 0.033  # 2 min / 60 min
+            proj_sa_home *= (1.0 - en_time_factor)
         
         # Suppression Siege Check (Fade Goalie Saves even if Volume looks ok)
         # Improvement 2: Heavy Siege Ban. If opponent generates > 31.5 SOG, DO NOT FADE GOALIE.
         opponent_vol_home = game.away_team.avg_sog_for
-        if "Suppression Siege (Home)" in scenarios and not skip_saves_under_vs_away and opponent_vol_home < 31.5:
+        if "Suppression Siege (Home)" in scenarios and not skip_saves_under_vs_away and opponent_vol_home < 31.5 and not home_defense_porous:
             picks.append(Pick(game.id, game.home_goalie.name, "Saves", 27.5, "Under", 5, f"Suppression Siege: {game.home_team.code} allows very few shots.", 18.0))
 
         # Efficiency Fade (Home Goalie)
-        if "Efficiency Mismatch (Away)" in scenarios and not skip_saves_under_vs_home and opponent_vol_home < 31.5: # Away Offense is elite vs Home Defense
+        if "Efficiency Mismatch (Away)" in scenarios and not skip_saves_under_vs_home and opponent_vol_home < 31.5 and not home_defense_porous: # Away Offense is elite vs Home Defense
              picks.append(Pick(game.id, game.home_goalie.name, "Saves", 28.5, "Under", 5, f"Efficiency Fade: {game.away_team.code} scores goals, limiting saves.", 18.0))
         
         # RECALIBRATED SIEGE THRESHOLD
         # STRICT GATE: Only take Overs on specific archetypes (Rookie/Elite)
-        elif proj_sa_home >= 36.0 and "Suppression Siege (Home)" not in scenarios:
+        if proj_sa_home >= 36.0 and "Suppression Siege (Home)" not in scenarios:
             if "Rookie" in game.home_goalie.status_note:
                  rationale = f"Heavy Siege Alert: {game.away_team.code} volume vs Rookie. Rookie Volume Lock."
                  picks.append(Pick(game.id, game.home_goalie.name, "Saves", 28.5, "Over", 5, rationale, 18.0))
@@ -899,6 +1031,18 @@ class NHLModel_Final:
         proj_sa_away = game.home_team.avg_sog_for + (2.0 if game.home_team.is_b2b is False else -2.0)
         if game.home_team.is_home: proj_sa_away += 3.0
         
+        # Score Effects: If Home is Favorite, they may turtle (reduce shots)
+        if game_script["home_is_favorite"]:
+            proj_sa_away *= 0.95  # 5% reduction (favorite turtle effect)
+        elif game_script["away_is_favorite"]:
+            # Away is favorite, home is underdog - home presses more
+            proj_sa_away *= 1.05  # 5% increase (underdog press effect)
+        
+        # Empty Net Variance: Close games have EN situations
+        if game_script["is_close_game"]:
+            en_time_factor = game_script["en_probability"] * 0.033  # 2 min / 60 min
+            proj_sa_away *= (1.0 - en_time_factor)
+        
         # v3.0.7: Calculate Margin of Safety for Saves Under
         # We estimate projected saves based on Volume * (1 - Opponent Shooting Pct)
         # Assuming avg SV% of .900 for rough calc, or using team GA stats
@@ -910,37 +1054,24 @@ class NHLModel_Final:
         
         # v3.1.0 THE CAROLINA RULE
         # Never play Saves Under vs CAR. They generate too much volume.
-        skip_saves_under_vs_home = False
-        skip_saves_under_vs_away = False
-        if game.home_team.code == "CAR": skip_saves_under_vs_away = True
-        if game.away_team.code == "CAR": skip_saves_under_vs_home = True
+        # (Already calculated above)
 
         # Suppression Siege Check (Fade Goalie Saves)
         # Improvement 2: Heavy Siege Ban. If opponent generates > 31.5 SOG, DO NOT FADE GOALIE.
         opponent_vol_away = game.home_team.avg_sog_for
-        if "Suppression Siege (Away)" in scenarios and not skip_saves_under_vs_home and opponent_vol_away < 31.5:
+        if "Suppression Siege (Away)" in scenarios and not skip_saves_under_vs_home and opponent_vol_away < 31.5 and not away_defense_porous:
              conf = 5
              if safety_margin_away < 2.0: conf = 4 # Downgrade if projected volume is close to line
              picks.append(Pick(game.id, game.away_goalie.name, "Saves", 27.5, "Under", conf, f"Suppression Siege: {game.away_team.code} allows very few shots.", 18.0))
 
         # Efficiency Fade (Away Goalie)
-        # BUG FIX v3.1.3: Was skip_saves_under_vs_home (Home=CAR), but we are picking Away Goalie.
-        # So we should check skip_saves_under_vs_away (meaning Away Goalie should NOT be faded if playing CAR, wait.)
-        # If Home is CAR, we skip_saves_under_vs_away.
-        # If Home is "Efficiency Mismatch", we fade Away Goalie.
-        # So if Home is CAR, we should NOT fade Away Goalie? No, CAR generates shots.
-        # "Efficiency Mismatch (Home)" means Home scores a lot.
-        # If Home is CAR, they generate shots AND scores.
-        # So Saves Under is good? NO. CAR generates VOLUME. Saves Under is BAD.
-        # So if Home is CAR, skip_saves_under_vs_away is TRUE.
-        # So `if ... and not skip_saves_under_vs_away:` is correct.
-        if "Efficiency Mismatch (Home)" in scenarios and not skip_saves_under_vs_away and opponent_vol_away < 31.5: 
+        if "Efficiency Mismatch (Home)" in scenarios and not skip_saves_under_vs_away and opponent_vol_away < 31.5 and not away_defense_porous: 
              # Check for Blowout Risk (Backup Goalie)
              picks.append(Pick(game.id, game.away_goalie.name, "Saves", 28.5, "Under", 5, f"Efficiency Fade: {game.home_team.code} scores goals, limiting saves.", 18.0))
         
         # RECALIBRATED SIEGE THRESHOLD
         # STRICT GATE: Only take Overs on specific archetypes (Rookie/Elite)
-        elif proj_sa_away >= 36.0 and "Suppression Siege (Away)" not in scenarios:
+        if proj_sa_away >= 36.0 and "Suppression Siege (Away)" not in scenarios:
              if "Rookie" in game.away_goalie.status_note:
                  rationale = f"Heavy Siege Alert: {game.home_team.code} volume vs Rookie. Rookie Volume Lock."
                  picks.append(Pick(game.id, game.away_goalie.name, "Saves", 29.5, "Over", 5, rationale, 18.0))
@@ -956,7 +1087,7 @@ class NHLModel_Final:
         if "Trap Game" in scenarios or "System Trap" in scenarios:
             confidence_boost_under += 1
         
-        if (game.away_team.avg_sog_for < 26.0 or "System Trap (Home)" in scenarios) and not skip_saves_under_vs_away:
+        if (game.away_team.avg_sog_for < 26.0 or "System Trap (Home)" in scenarios) and not skip_saves_under_vs_away and not home_defense_porous:
             line = 26.5
             conf = min(4 + confidence_boost_under, 5)
             # Safety Margin Check
@@ -964,7 +1095,7 @@ class NHLModel_Final:
             if conf >= 3:
                 picks.append(Pick(game.id, game.home_goalie.name, "Saves", line, "Under", conf, f"Volume Fade: {game.away_team.code} is low event/Trap.", 12.0))
             
-        if (game.home_team.avg_sog_for < 26.0 or "System Trap (Away)" in scenarios) and not skip_saves_under_vs_home:
+        if (game.home_team.avg_sog_for < 26.0 or "System Trap (Away)" in scenarios) and not skip_saves_under_vs_home and not away_defense_porous:
             line = 26.5
             conf = min(4 + confidence_boost_under, 5)
             # Safety Margin Check
@@ -974,12 +1105,21 @@ class NHLModel_Final:
 
         return picks
 
-    def _analyze_skaters(self, game: Game, lean: Dict[str, str], force_all: bool = False) -> List[Pick]:
+    def _analyze_skaters(self, game: Game, lean: Dict[str, str], context: Dict[str, Any], force_all: bool = False) -> List[Pick]:
         picks = []
         form_analyzer = PlayerFormAnalyzer()
         
-        context = ScenarioAnalyzer.analyze_scenario(game)
-        scenarios = context["tags"] 
+        # Use pre-calculated context (optimization: avoid redundant API calls)
+        scenarios = context["tags"]
+        
+        # v3.3.1 FIX: Elite Immunity List (Generational players who can break through even in trap games)
+        # These players should NOT be faded Under 1.5 unless projected < 0.5 points
+        # Use last names for flexible matching (handles "Alex Ovechkin" vs "A. Ovechkin")
+        ELITE_IMMUNITY_LAST_NAMES = {
+            "Ovechkin", "McDavid", "MacKinnon", "Matthews",
+            "Draisaitl", "Kucherov", "Panarin", "Crosby",
+            "Pastrnak", "Hughes", "Robertson", "Rantanen"
+        } 
         
         for p in game.key_players:
             # Rule: Always Profile Player Before Analysis (Ensure Status Note is Up-to-Date)
@@ -992,9 +1132,24 @@ class NHLModel_Final:
             form = form_analyzer.analyze_form(p, game.date)
             p.recent_form = form 
             
-            # Re-Profile with Form Data (Optional, if we want to add 'Heater' tags to status_note)
-            # For now, we keep status_note based on Season Avgs, and use 'form' variable for recent trends.
-            
+            # --- STRICT AVAILABILITY GATE (v3.2.5) ---
+            # 1. Inactive Check (No 2025 logs)
+            if form.get("Trend") == "Inactive":
+                # Skip player completely
+                continue
+                
+            # 2. Recency Gate (Days Since Last Game)
+            # If > 7 days, likely injured or scratched. Skip.
+            # Exception: Season Opener (October)
+            if form.get("Days_Since_Last", 0) > 7 and game.date.month not in [10]:
+                 # Skip
+                 continue
+                 
+            # 3. Ghost Gate (Zero Production)
+            # If L5 Points 0 AND L5 SOG < 0.5, they are likely buried depth with no props
+            if form["L5_Points"] == 0 and form["L5_SOG"] < 0.5:
+                 continue
+
             # Determine Opponent
             opponent = game.away_team if p.team == game.home_team.code else game.home_team
             
@@ -1109,18 +1264,40 @@ class NHLModel_Final:
                 team_gf = game.home_team.goals_for_per_game if p.team == game.home_team.code else game.away_team.goals_for_per_game
                 
                 # Threshold for Over 0.5: Need reliable production.
-                # If proj > 0.9, high chance of 1 point.
-                if proj_pts > 0.85:
+                # v3.3.1 FIX: Defensemen require higher threshold (0.95 vs 0.85 for forwards)
+                # Defensemen are more volatile for Points Over 0.5 (0W-3L in backtest)
+                is_defenseman = p.position == Position.DEFENSEMAN
+                threshold = 0.95 if is_defenseman else 0.85
+                
+                if proj_pts > threshold:
                     confidence = 5
                     
+                    # v3.3.1 FIX: Defensemen need stricter consistency check (70% vs 60%)
+                    consistency_threshold = 0.70 if is_defenseman else 0.60
+                    
                     # Critique 2 Improvement: Consistency Check
-                    # If consistency < 60% (less than 12/20 hits), downgrade.
+                    # If consistency < threshold, downgrade.
                     consistency = form.get("Consistency_Points", 1.0)
-                    if consistency < 0.60:
+                    if consistency < consistency_threshold:
                         confidence = 4 # Downgrade due to lack of consistency
                         rationale = f"Safety Valve: {p.name} proj {proj_pts:.2f} pts. (Downgraded: Low Consistency {consistency*100:.0f}%)"
                     else:
                         rationale = f"Safety Valve: {p.name} proj {proj_pts:.2f} pts. Target Over 0.5."
+                    
+                    # v3.3.1 FIX: Defensemen skip Points Over 0.5 in System Trap games
+                    # (All 3 defensemen losses were in System Trap games)
+                    # v3.3.2: Only skip in true volume traps, not efficiency traps (efficiency traps have high shooting %)
+                    is_volume_trap = "System Trap" in str(scenarios) and "Efficiency Trap" not in str(scenarios)
+                    if is_defenseman and is_volume_trap:
+                        # Skip defensemen Points Over 0.5 in volume trap games
+                        continue
+                    
+                    # v3.3.0 RED TEAM: Playmaker Trap (Goal Share Check)
+                    # Pure passers (goal share < 20%) rely too much on teammates finishing
+                    goal_share = form.get("goal_share", 0.4)
+                    if goal_share < 0.20 and form["L5_Points"] > 0.5:
+                        confidence = min(confidence, 4)  # Downgrade pure passers
+                        rationale += f" (Low Goal Share {goal_share*100:.0f}% - Passer Risk)."
                     
                     if team_gf < 2.6: 
                         confidence = min(confidence, 4) # Downgrade if team offense is struggling
@@ -1131,16 +1308,37 @@ class NHLModel_Final:
             # Points Under 1.5 (Fade Explosion)
             # We fade the multi-point game, not the player entirely.
             if p.avg_points < 1.1: # Don't fade McDavid/MacKinnon Under 1.5 (too risky)
+                # v3.3.1 FIX: Elite Immunity Exception
+                # Generational players (Ovechkin, McDavid, etc.) can break through even in trap games
+                # Always skip Under 1.5 for elite players - they have proven ability to score regardless of matchup
+                # Use last name matching to handle name variations ("Alex Ovechkin" vs "A. Ovechkin")
+                player_last_name = p.name.split()[-1] if " " in p.name else p.name
+                if player_last_name in ELITE_IMMUNITY_LAST_NAMES:
+                    # Always skip Under 1.5 for elite players - too risky to fade generational talent
+                    continue
+                
                 # Conditions for fading ceiling:
-                # 1. Tough Matchup (Suppression/Trap)
+                # 1. Tough Matchup (Suppression/Volume Trap)
                 # 2. Cold Streak
-                is_tough_matchup = opponent.goals_against_per_game < 2.9 or "Trap" in str(scenarios)
+                # v3.3.2: Efficiency Trap is NOT a tough matchup for Under 1.5 (high shooting % = more goals)
+                is_volume_trap = "System Trap" in str(scenarios) and "Efficiency Trap" not in str(scenarios)
+                is_tough_matchup = opponent.goals_against_per_game < 2.9 or is_volume_trap
                 
                 if (is_tough_matchup or form["Trend"] == "Cold") and not is_efficiency_favored:
-                     conf = 4
-                     # EDGE: Depth players in Trap games rarely hit 2+ points. Boost confidence.
-                     if "Trap" in str(scenarios) and "Elite" not in p.status_note: conf = 5
-                     picks.append(Pick(game.id, p.name, "Points", 1.5, "Under", conf, f"Ceiling Fade: {opponent.code} limits offense. Betting against multi-point game.", 12.0))
+                     # Check consistency for Under 1.5
+                     if form.get("hit_rate_l20_points_under_1_5", 0) > 0.6: # Require 60% hit rate for Under 1.5
+                         conf = 4
+                         # EDGE: Depth players in Volume Trap games rarely hit 2+ points. Boost confidence.
+                         # v3.3.2: Only boost for volume traps, not efficiency traps
+                         if is_volume_trap and "Elite" not in p.status_note: conf = 5
+                         
+                         # v3.2.6 Odds Gate: Only take Under 1.5 if the line isn't too juiced (e.g. > -175)
+                         # We simulate odds check here. In production, this would filter based on real odds.
+                         # Assuming standard juice (-110 to -140) is fine. 
+                         # If implied probability > 70% (Odds < -230), the edge is gone.
+                         # We add a note to check odds.
+                         
+                         picks.append(Pick(game.id, p.name, "Points", 1.5, "Under", conf, f"Ceiling Fade: {opponent.code} limits offense. Betting against multi-point game.", 12.0))
                      
             # --- Legacy 1.5 Logic (Disabled but kept for reference) ---
             # green_light_1_5 = False
@@ -1219,105 +1417,127 @@ def parse_game_from_api(game_data: Dict[str, Any], date_str: Optional[str] = Non
         home_team = TeamStatDatabase.get_team(home_abbr)
         away_team = TeamStatDatabase.get_team(away_abbr)
         
-        # Determine B2B (Simplified)
-        
         # Placeholder players
         home_goalie = Player(f"{home_abbr} Goalie", home_abbr, Position.GOALIE)
         away_goalie = Player(f"{away_abbr} Goalie", away_abbr, Position.GOALIE)
         
         key_players = [] 
-        key_players.extend(PlayerDatabase.get_key_players(home_abbr))
-        key_players.extend(PlayerDatabase.get_key_players(away_abbr))
         
-        # --- AUTOMATED ROSTER GATE (v3.0.5) ---
-        # Fetch live roster to check for Scratches/Injuries
+        # --- AUTOMATED ROSTER GATE (v3.2.4 Dynamic Population) ---
         game_id = game_data.get('id')
         fetcher = NHLScheduleFetcher()
-        roster = fetcher.fetch_roster(game_id)
+        roster = fetcher.fetch_roster(game_id) # Returns dict with 'home'/'away' lists of player dicts
         
         home_roster = roster.get("home", [])
         away_roster = roster.get("away", [])
         
-        # v3.0.10 DYNAMIC ROSTER POPULATION
-        # If PlayerDatabase is empty for a team (e.g. SEA, UTA), populate from Live Roster.
-        if not PlayerDatabase.get_key_players(home_abbr) and home_roster:
-            # Add top 6 forwards and top 2 D from roster (Simplified: just take first 8 names)
-            # Roster strings are just "FirstName LastName". We need to guess Position.
-            # Ideally we need a better roster fetcher. But for now, we create generic players.
-            for name in home_roster[:6]: # Assume top of list are starters? No guarantee.
-                 # Better: Do nothing and accept no props for unknown teams?
-                 # Or create a generic "Player" and let Profile Dynamic fix it?
-                 # Profile Dynamic needs stats. We don't have stats yet.
-                 pass
-        
-        # v3.0.10: Actually, let's fix the Database hole by monkey-patching it in granular_eval for now,
-        # or accepting that we only model teams we have data for.
-        # But user said "use full power".
-        # I will patch parse_game_from_api to attempt to build players from roster if missing.
-        
-        if not key_players and (home_roster or away_roster):
-             # Fallback: Create players from roster names
-             for name in home_roster:
-                 p = Player(name, home_abbr, Position.CENTER, avg_sog=2.0, avg_points=0.5, status_note="")
-                 # We rely on profile_player_dynamic to fetch real stats later!
-                 key_players.append(p)
-             for name in away_roster:
-                 p = Player(name, away_abbr, Position.CENTER, avg_sog=2.0, avg_points=0.5, status_note="")
-                 key_players.append(p)
+        # Function to enrich players with stats
+        def build_roster_players(team_roster, team_abbr):
+            # Fetch Season Stats for Team
+            club_stats = fetcher.fetch_club_stats(team_abbr)
+            skater_stats_map = {s['playerId']: s for s in club_stats.get('skaters', [])}
+            
+            built_players = []
+            
+            for p_entry in team_roster:
+                pid = p_entry['id']
+                name = p_entry['name']
+                pos_group = p_entry['position'] # "forwards", "defense", "goalies"
+                
+                if pos_group == "goalies": continue # Skip goalies for skater props
+                
+                # Determine Position Enum
+                pos = Position.WINGER # Default
+                if pos_group == "defense": pos = Position.DEFENSEMAN
+                elif pos_group == "forwards":
+                    # Check boxscore or roster for specific position? 
+                    # For now default to Winger unless we know better.
+                    # Stats API usually has 'positionCode'
+                    pass
 
-        # If roster fetch failed (empty), we skip the check to avoid false positives.
+                # Get Season Stats
+                stats = skater_stats_map.get(pid)
+                if not stats: continue # Skip players with no stats (Rookies with 0 games?)
+                
+                # Filter Low Volume Players (Efficiency optimization)
+                # Skip players with < 10 GP or very low production to save processing time
+                gp = stats.get('gamesPlayed', 0)
+                if gp < 5: continue
+                
+                avg_points = stats.get('points', 0) / gp
+                avg_sog = stats.get('shots', 0) / gp
+                
+                # Filter: Only consider "Relevant" players for betting
+                # Avg SOG > 1.5 OR Avg Points > 0.4
+                if avg_sog < 1.5 and avg_points < 0.4: continue
+                
+                # Create Player Object
+                # Correct Position if possible
+                api_pos = stats.get('positionCode', 'W')
+                if api_pos == 'C': pos = Position.CENTER
+                elif api_pos == 'D': pos = Position.DEFENSEMAN
+                else: pos = Position.WINGER
+                
+                p_obj = Player(name, team_abbr, pos, id=pid, avg_sog=avg_sog, avg_points=avg_points)
+                
+                # Dynamic Profiling
+                PlayerDatabase.profile_player_dynamic(p_obj, {})
+                built_players.append(p_obj)
+                
+            return built_players
+
+        # Build Dynamic Roster
         if home_roster and away_roster:
-            # Check Home Team Top Center
-            home_top_centers = ["Connor McDavid", "Nathan MacKinnon", "Auston Matthews", "Jack Hughes", "Sidney Crosby", "Brayden Point", "Aleksander Barkov", "Elias Pettersson", "Jack Eichel", "Sebastian Aho"]
+            # If we have live roster, use it to build key_players dynamically
+            key_players.extend(build_roster_players(home_roster, home_abbr))
+            key_players.extend(build_roster_players(away_roster, away_abbr))
             
-            # Identify if Home Team HAS a top center usually
-            for star in home_top_centers:
-                 # Check if this team normally has this player
-                 # Simplified: We check if the star matches the team by looking up in PlayerDatabase (or simple list logic)
-                 pass # Too complex to map all stars to teams here. 
-                 # Better approach: Check if the key_players marked as "Center" and "Elite" are present.
+        else:
+            # Fallback 1: Try to fetch FULL roster from Club Stats (since live boxscore was empty)
+            # This happens for future games where rosters aren't submitted yet.
+            # We assume top scorers are playing.
             
-            # Filter Key Players based on Active Status
-            active_key_players = []
-            for p in key_players:
-                # Determine team roster to check
-                team_roster = home_roster if p.team == home_abbr else away_roster
-                
-                # Loose matching (API name might vary slightly, e.g. "J.T. Miller" vs "J. Miller")
-                # We check if LAST NAME is in the roster string list
-                is_active = False
-                p_lastname = p.name.split(" ")[-1]
-                
-                for roster_name in team_roster:
-                    if p_lastname in roster_name:
-                        is_active = True
-                        break
-                
-                if is_active:
-                    # Enrich with stats from roster check if possible?
-                    # The simple roster check only returns names. 
-                    # Ideally we would fetch stats here.
-                    # For now, we apply the Dynamic Profiler to the existing player object
-                    # assuming its 'avg_sog' might be updated or default.
-                    # Since we don't have live stats in this block, we rely on the hardcoded values for now.
-                    # BUT, we can add the profile method call for future expansion.
-                    PlayerDatabase.profile_player_dynamic(p, {}) 
-                    active_key_players.append(p)
-                else:
-                    # Mark as Injured/Scratch
-                    p.is_injured = True
-                    # Check if this triggers Usage Vacuum
-                    if "Elite" in p.status_note or "Center" in p.position.name:
-                        if p.team == home_abbr:
-                            home_team.top_center_out = True # Flag generic vacuum
-                        else:
-                            away_team.top_center_out = True
+            def build_from_club_stats(team_abbr):
+                club_stats = fetcher.fetch_club_stats(team_abbr)
+                built_players = []
+                for s in club_stats.get('skaters', []):
+                    # Filter depth
+                    gp = s.get('gamesPlayed', 0)
+                    if gp < 5: continue
+                    avg_sog = s.get('shots', 0) / gp
+                    avg_points = s.get('points', 0) / gp
+                    if avg_sog < 1.5 and avg_points < 0.4: continue
                     
-                    # Still include in list but marked injured so we don't pick them?
-                    # No, logic says `if not p.is_injured`
-                    active_key_players.append(p)
+                    name = f"{s.get('firstName', {}).get('default','')} {s.get('lastName', {}).get('default','')}"
+                    pid = s.get('playerId')
+                    
+                    # Position guess
+                    pos_code = s.get('positionCode', 'W')
+                    if pos_code == 'C': pos = Position.CENTER
+                    elif pos_code == 'D': pos = Position.DEFENSEMAN
+                    else: pos = Position.WINGER
+                    
+                    p_obj = Player(name, team_abbr, pos, id=pid, avg_sog=avg_sog, avg_points=avg_points)
+                    PlayerDatabase.profile_player_dynamic(p_obj, {})
+                    built_players.append(p_obj)
+                return built_players
 
-            key_players = active_key_players
+            # Attempt fallback
+            roster_players_home = build_from_club_stats(home_abbr)
+            roster_players_away = build_from_club_stats(away_abbr)
+            
+            if roster_players_home and roster_players_away:
+                 key_players.extend(roster_players_home)
+                 key_players.extend(roster_players_away)
+            else:
+                 # Last Resort: Hardcoded DB
+                 key_players.extend(PlayerDatabase.get_key_players(home_abbr))
+                 key_players.extend(PlayerDatabase.get_key_players(away_abbr))
+        
+        # Flag Usage Vacuum (Simplified)
+        # If McDavid is not in key_players but EDM is playing, flag it?
+        # Requires knowing who SHOULD be there. Hard with dynamic lists.
+        # For now, we trust the roster provided is the active one.
         
         # Fix Date
         if date_str:
@@ -1368,7 +1588,7 @@ def main():
     model = NHLModel_Final()
     picks = model.analyze_slate(games)
 
-    print("\n🏆 MASTER PICK BOARD (Model v3.1.3 - Restored Hybrid + Fixed) 🏆")
+    print("\n🏆 MASTER PICK BOARD (Model v3.3.2 - System Trap Refinement) 🏆")
     print(f"Date: {args.date}\n")
     print(f"{'CONF':<6} | {'EV':<6} | {'MATCHUP':<10} | {'PLAYER/TEAM':<20} | {'MARKET':<8} | {'ODDS':<5} | {'RATIONALE'}")
     print("-" * 110)
