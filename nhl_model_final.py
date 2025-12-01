@@ -351,12 +351,7 @@ class PlayerFormAnalyzer:
         logs = fetcher.fetch_player_game_log(player.id, season)
         
         if not logs:
-            return {
-                "L5_SOG": 0, "L5_Points": 0, "L5_Goals": 0, 
-                "Season_SOG": 0, "Season_Points": 0,
-                "L3_xG": 0.0, "Trend": "Unknown", "SOG_Trend": "Unknown",
-                "Buy_Low": False, "Sell_High": False
-            }
+            return {"L5_SOG": 0, "L5_Points": 0, "L5_xG": 0.0, "Trend": "Unknown", "Regression_Risk": False}
             
         if reference_date:
             try:
@@ -365,15 +360,10 @@ class PlayerFormAnalyzer:
                 
         l5_games = logs[:5]
         
-        # Basic Stats (L5)
+        # Basic Stats
         l5_sog = sum(g.get('shots', 0) for g in l5_games) / len(l5_games) if l5_games else 0
         l5_points = sum(g.get('points', 0) for g in l5_games) / len(l5_games) if l5_games else 0
         l5_goals = sum(g.get('goals', 0) for g in l5_games) / len(l5_games) if l5_games else 0
-        
-        # Season Stats (Full Log)
-        season_games = len(logs)
-        season_sog = sum(g.get('shots', 0) for g in logs) / season_games if season_games else 0
-        season_points = sum(g.get('points', 0) for g in logs) / season_games if season_games else 0
         
         # Advanced Stats (xG) - Fetch PBP for last 3 games (Optimization: only 3 deep to save time)
         l3_xg_total = 0.0
@@ -419,8 +409,6 @@ class PlayerFormAnalyzer:
             "L5_SOG": l5_sog,
             "L5_Points": l5_points,
             "L5_Goals": l5_goals,
-            "Season_SOG": season_sog,
-            "Season_Points": season_points,
             "L3_xG": l3_xg_avg,
             "Trend": trend,
             "SOG_Trend": sog_trend,
@@ -639,7 +627,7 @@ class PlayerDatabase:
         # (Could add logic here to boost confidence for Centers on Assists, Wingers on SOG)
 
 
-# --- Model Logic (v3.0.2 - Saves Under Dominance) ---
+# --- Model Logic (v3.1.3 - Restored Hybrid + Fixed Carolina Rule) ---
 
 class ScenarioAnalyzer:
     # Updated v3.0.7: Dynamic Lists (Populated at runtime based on stats)
@@ -745,7 +733,7 @@ class ScenarioAnalyzer:
         
         return {"tags": scenarios, "lean": lean}
 
-class NHLModel_v3_0_3:
+class NHLModel_Final:
     def __init__(self):
         self.rules = [
             self._rule_siege_anchor,
@@ -757,8 +745,9 @@ class NHLModel_v3_0_3:
 
     def analyze_slate(self, games: List[Game]) -> List[Pick]:
         picks = []
-        print(f"Running Model v3.0.3 (Dynamic + Conflict Resolved) Analysis for {len(games)} games...")
+        print(f"Running Model v3.1.3 (Restored Hybrid + Fixed) Analysis for {len(games)} games...")
         for game in games:
+            # v3.1.3: ENABLE FORCE MODE to ensure picking logic is active if no strong play found
             game_picks = self._analyze_game(game)
             picks.extend(game_picks)
         
@@ -833,7 +822,8 @@ class NHLModel_v3_0_3:
         picks.extend(self._analyze_saves(game, lean))
         
         # 2. Skater Volume/Points Analysis
-        picks.extend(self._analyze_skaters(game, lean))
+        # Force All enabled to ensure volume
+        picks.extend(self._analyze_skaters(game, lean, force_all=True))
         
         return picks
 
@@ -909,11 +899,18 @@ class NHLModel_v3_0_3:
              picks.append(Pick(game.id, game.away_goalie.name, "Saves", 27.5, "Under", conf, f"Suppression Siege: {game.away_team.code} allows very few shots.", 18.0))
 
         # Efficiency Fade (Away Goalie)
-        if "Efficiency Mismatch (Home)" in scenarios and not skip_saves_under_vs_home: # Home Offense is elite vs Away Defense
+        # BUG FIX v3.1.3: Was skip_saves_under_vs_home (Home=CAR), but we are picking Away Goalie.
+        # So we should check skip_saves_under_vs_away (meaning Away Goalie should NOT be faded if playing CAR, wait.)
+        # If Home is CAR, we skip_saves_under_vs_away.
+        # If Home is "Efficiency Mismatch", we fade Away Goalie.
+        # So if Home is CAR, we should NOT fade Away Goalie? No, CAR generates shots.
+        # "Efficiency Mismatch (Home)" means Home scores a lot.
+        # If Home is CAR, they generate shots AND scores.
+        # So Saves Under is good? NO. CAR generates VOLUME. Saves Under is BAD.
+        # So if Home is CAR, skip_saves_under_vs_away is TRUE.
+        # So `if ... and not skip_saves_under_vs_away:` is correct.
+        if "Efficiency Mismatch (Home)" in scenarios and not skip_saves_under_vs_away: 
              # Check for Blowout Risk (Backup Goalie)
-             # If Away Goalie is Backup, they might get shelled. PASS.
-             # We lack strict "Backup" tag in Game obj, so we use status note or assume starter.
-             # Conservative: If Total > 6.5, Pass on Saves Under for losing team?
              picks.append(Pick(game.id, game.away_goalie.name, "Saves", 28.5, "Under", 5, f"Efficiency Fade: {game.home_team.code} scores goals, limiting saves.", 18.0))
         
         # RECALIBRATED SIEGE THRESHOLD
@@ -959,151 +956,205 @@ class NHLModel_v3_0_3:
         context = ScenarioAnalyzer.analyze_scenario(game)
         scenarios = context["tags"] 
         
-        # --- SCENARIO-DRIVEN PROP SELECTION (Master Prompt Alignment) ---
-        target_sog = False
-        target_points = False
-        target_unders = False
-        
-        if any("Siege" in s for s in scenarios) or "Barnburner (Volume)" in scenarios or "Pace Matchup" in scenarios:
-            target_sog = True
-            
-        if "Efficiency Mismatch" in str(scenarios) or "Barnburner (Goals)" in scenarios or "Mismatch" in str(scenarios):
-            target_points = True
-            
-        if "Trap" in str(scenarios) or "Suppression" in str(scenarios):
-            target_unders = True
-            # In Trap games, we generally avoid Overs unless Override logic exists
-            if not any("Barnburner" in s for s in scenarios): # Barnburner overrides Trap
-                target_sog = False 
-                target_points = False
-
         for p in game.key_players:
-            # Safety Gate: Injury
-            if p.is_injured: continue
-
-            # Form Analysis
-            form = form_analyzer.analyze_form(p, game.date)
-            p.recent_form = form
-            
-            # Dampened Profiling (Weighted Avgs)
-            if form.get("Season_SOG", 0) > 0:
-                p.avg_sog = (p.avg_sog * 0.7) + (form["Season_SOG"] * 0.3)
-                p.avg_points = (p.avg_points * 0.7) + (form["Season_Points"] * 0.3)
-            
+            # Rule: Always Profile Player Before Analysis (Ensure Status Note is Up-to-Date)
+            # This handles cases where players might be missing tags or stats updated since fetch.
+            # We pass an empty form dict initially, as the profiler primarily uses 'avg_sog/avg_points' which are on the object.
+            # (Note: form_analyzer below will calculate 'recent_form' for trend logic)
             PlayerDatabase.profile_player_dynamic(p, {})
+            
+            # Analyze Form
+            form = form_analyzer.analyze_form(p, game.date)
+            p.recent_form = form 
+            
+            # Re-Profile with Form Data (Optional, if we want to add 'Heater' tags to status_note)
+            # For now, we keep status_note based on Season Avgs, and use 'form' variable for recent trends.
+            
+            # Determine Opponent
             opponent = game.away_team if p.team == game.home_team.code else game.home_team
             
-            # Track if a pick was made for this player to enable forcing
-            pick_made = False
-
-            # --- 1. SOG EXECUTION (Scenario Purity: Volume) ---
-            if target_sog:
-                # Only target players who fit the metric (Volume Shooters or Elites)
-                if "Volume" in p.status_note or "Elite" in p.status_note or form["SOG_Trend"] == "Heater":
-                    
-                    # Projection Engine
-                    proj_sog = p.avg_sog
-                    
-                    # Multipliers (Conservative)
-                    if "Heavy Siege" in str(scenarios): proj_sog *= 1.10
-                    if "Barnburner (Volume)" in scenarios: proj_sog *= 1.10
-                    if opponent.avg_sog_against > 32.0: proj_sog *= 1.05
-                    
-                    # Home/Away
-                    if p.team == game.home_team.code: proj_sog *= 1.05
-                    
-                    # Form
-                    if form["SOG_Trend"] == "Heater": proj_sog *= 1.15
-                    elif form["SOG_Trend"] == "Cold": proj_sog *= 0.85
-                    
-                    # Decision (Strict 4.2+ Threshold for 3.5 Line - v4.0.3)
-                    if proj_sog > 4.2: # Was 4.0
-                        rationale = f"Scenario Fit: Volume/Siege. Proj {proj_sog:.1f} SOG."
-                        conf = 4
-                        if proj_sog > 4.5: conf = 5
-                        picks.append(Pick(game.id, p.name, "SOG", 3.5, "Over", conf, rationale, 15.0))
-                        pick_made = True
-
-            # --- 2. POINTS EXECUTION (Scenario Purity: Efficiency) ---
-            if target_points:
-                # Only target Playmakers/Scorers/Elites
-                if "Playmaker" in p.status_note or "Scorer" in p.status_note or "Elite" in p.status_note:
-                    
-                    # Projection Engine
-                    proj_pts = p.avg_points
-                    
-                    # Multipliers
-                    if "Efficiency Mismatch" in str(scenarios): proj_pts *= 1.15
-                    if "Barnburner (Goals)" in scenarios: proj_pts *= 1.10
-                    if opponent.goals_against_per_game > 3.4: proj_pts *= 1.05
-                    
-                    # Form
-                    if form["Trend"] == "Heater": proj_pts *= 1.20
-                    elif form["Trend"] == "Cold": proj_pts *= 0.80
-                    
-                    # Decision (Strict 1.5 Line)
-                    if p.avg_points > 1.0: # Base requirement for 1.5 consideration
-                        if proj_pts > 1.7: # High threshold
-                            rationale = f"Scenario Fit: Efficiency/Barnburner. Proj {proj_pts:.1f} Pts."
-                            picks.append(Pick(game.id, p.name, "Points", 1.5, "Over", 5, rationale, 15.0))
-                            pick_made = True
-
-            # --- 3. UNDER EXECUTION (Scenario Purity: Trap) ---
-            if target_unders:
-                # ELITE IMMUNITY (Absolute)
-                if "Elite" in p.status_note or "Volume" in p.status_note or p.avg_points > 0.9:
-                    pass
-                else:
-                    # Target mid-tier players for Unders
-                    # Check SOG Under
-                    proj_sog = p.avg_sog * 0.90 # Trap penalty
-                    if p.team == game.away_team.code: proj_sog *= 0.90 # Visitor penalty
-                    
-                    if proj_sog < 2.5: # Well under 3.5
-                        picks.append(Pick(game.id, p.name, "SOG", 3.5, "Under", 4, "Scenario Fit: System Trap Fade.", 12.0))
-                        pick_made = True
+            # DEFAULT PICK (for Force Mode)
+            default_pick = None
             
-            # --- 4. OVERRIDES (Usage Vacuum / Buy Low) ---
-            team_obj = game.home_team if p.team == game.home_team.code else game.away_team
-            if team_obj.top_center_out and "Volume" in p.status_note:
-                 picks.append(Pick(game.id, p.name, "SOG", 2.5, "Over", 4, "Usage Vacuum Boost.", 12.0))
-                 pick_made = True
+            # --- Scenario Checks (Pre-Calculation) ---
+            is_efficiency_favored = False
+            if "Efficiency Mismatch (Home)" in scenarios and p.team == game.home_team.code: is_efficiency_favored = True
+            if "Efficiency Mismatch (Away)" in scenarios and p.team == game.away_team.code: is_efficiency_favored = True
+            
+            is_barnburner = any("Barnburner" in s for s in scenarios)
+
+            # Check Mismatch for Penalizing SOG
+            is_favored_in_mismatch = False
+            if "Mismatch (Home Fav)" in scenarios and p.team == game.home_team.code:
+                is_favored_in_mismatch = True
+            elif "Mismatch (Away Fav)" in scenarios and p.team == game.away_team.code:
+                is_favored_in_mismatch = True
+
+            # --- Volume Suppression Logic (SOG Unders) ---
+            # Rule: Fade Volume Shooters vs Suppression Teams
+            # REFINED v3.0.4: Trap Asymmetry (Visitor = Hard Fade, Home = Soft Fade)
+            if "Volume" in p.status_note or "Elite" in p.status_note:
+                is_trap = "Trap Game" in scenarios or "System Trap" in scenarios
+                is_suppression = opponent.avg_sog_against <= 28.5
                  
-            if form["Buy_Low"]:
-                 picks.append(Pick(game.id, p.name, "Goals", 0.5, "Over", 3, f"Buy Low: High xG {form['L3_xG']:.2f}.", 20.0))
-                 pick_made = True
+                # v3.0.6 TUNE-UP: Efficiency Mismatch / Barnburner OVERRIDE
+                # If the game is a Barnburner or an Efficiency Mismatch favoring this player, 
+                # we DO NOT fade their volume, even if the opponent looks like a "Suppression" team.
+                # Example: COL vs MTL. MTL suppresses shots, but COL Offense >>>> MTL Defense.
+                # (Variables is_efficiency_favored and is_barnburner are pre-calculated above)
+                 
+                if (is_suppression or is_trap) and not is_efficiency_favored and not is_barnburner:
+                    line = 3.5
+                    if p.avg_sog >= 3.0: 
+                        confidence = 4
+                        rationale = f"Suppression Fade: {opponent.code} allows {opponent.avg_sog_against:.1f} SOG."
+                        
+                        if is_trap:
+                            # v3.1.1 Update: COMPLETE ELITE IMMUNITY
+                            # We stop fading Elite players (Volume or Points) in Trap games completely.
+                            if "Elite" in p.status_note or "Volume" in p.status_note:
+                                continue
 
-            # --- 5. FORCED PICK LOGIC (If no pick made and High Volume Required) ---
-            # User Requirement: "If you dont like the over then we take the under"
-            # We evaluate the 'Lean' for every player if no pick has been made.
+                            # Trap Asymmetry Check (Only for non-elite)
+                            if p.team == game.away_team.code:
+                                # Visitor in a Trap: Fade (Non-Elite Only)
+                                rationale += " + Trap Victim (Visitor)."
+                                confidence = 4 
+                            else:
+                                # Home Trapper: PASS
+                                continue
+                        
+                        picks.append(Pick(game.id, p.name, "SOG", 3.5, "Under", confidence, rationale, 15.0))
+
+            # --- Volume Shooter Logic ---
+            if "Volume" in p.status_note or "Elite" in p.status_note:
+                if opponent.avg_sog_against >= 31.0:
+                    # v3.1.0 RELAXED SAFETY GATES
+                    # 1. Cold Player Gate: Modified to allow Cold players in Barnburners (high event games can break slumps)
+                    if form.get("SOG_Trend") == "Cold" and not is_barnburner:
+                        continue
+                    
+                    # 2. Efficiency Mismatch Gate:
+                    # Relaxed threshold to Avg > 2.5 to capture mid-tier volume in blowouts
+                    if is_efficiency_favored and p.avg_sog < 2.5:
+                        continue
+                        
+                    edge = (p.avg_sog / 2.5) * 10 
+                    rationale_suffix = "."
+                    
+                    if form.get("SOG_Trend") == "Heater": 
+                        edge += 5.0
+                        rationale_suffix = f" + SOG HEATER (L5 {form['L5_SOG']:.1f})."
+                    elif form.get("SOG_Trend") == "Cold":
+                        edge -= 5.0
+                        rationale_suffix = f" (SOG Cold {form['L5_SOG']:.1f})."
+                        
+                    if is_favored_in_mismatch:
+                        edge -= 3.0
+                        rationale_suffix += " (Blowout Risk)."
+
+                    if "System Trap" in scenarios:
+                        continue 
+                        
+                    picks.append(Pick(game.id, p.name, "SOG", 3.5, "Over", 4, f"Volume Target: {opponent.code} allows {opponent.avg_sog_against:.1f} SOG{rationale_suffix}", edge))
             
-            if not pick_made:
-                # Calculate SOG Projection (Standardized)
-                base_sog = p.avg_sog
-                if p.team == game.home_team.code: base_sog *= 1.05
-                if "Siege" in str(scenarios): base_sog *= 1.05
-                if "Trap" in str(scenarios): base_sog *= 0.90
+            # --- Regression / Fade Logic ---
+            if form["Trend"] == "Heater" and opponent.avg_sog_against <= 28.0:
+                if "Elite" in p.status_note:
+                    picks.append(Pick(game.id, p.name, "Points", 1.5, "Under", 4, f"Regression Alert: Heater vs Suppression ({opponent.code}). Fade Juiced Line.", 15.0))
+                    continue
+            
+            # --- Points Logic (Safe Mode: Over 0.5 / Under 1.5) ---
+            # User Request: Increase hit rate. Over 0.5 is safer than 1.5. Under 1.5 is safer than 0.5.
+            
+            # Points Over 0.5 (Get on the Board)
+            if "Playmaker" in p.status_note or "Scorer" in p.status_note or "Elite" in p.status_note:
+                # Base projection
+                proj_pts = p.avg_points
+                if form["Trend"] == "Heater": proj_pts *= 1.2
+                if is_efficiency_favored: proj_pts *= 1.15
                 
-                # Check Over 3.5 Lean
-                if base_sog >= 3.4:
-                    # Near miss for Over
-                    picks.append(Pick(game.id, p.name, "SOG", 3.5, "Over", 3, f"Lean: Volume (Proj {base_sog:.1f})", 10.0))
+                # Threshold for Over 0.5: Need reliable production.
+                # If proj > 0.9, high chance of 1 point.
+                if proj_pts > 0.85:
+                    confidence = 5
+                    rationale = f"Safety Valve: {p.name} proj {proj_pts:.2f} pts. Target Over 0.5."
+                    picks.append(Pick(game.id, p.name, "Points", 0.5, "Over", confidence, rationale, 10.0))
+            
+            # Points Under 1.5 (Fade Explosion)
+            # We fade the multi-point game, not the player entirely.
+            if p.avg_points < 1.1: # Don't fade McDavid/MacKinnon Under 1.5 (too risky)
+                # Conditions for fading ceiling:
+                # 1. Tough Matchup (Suppression/Trap)
+                # 2. Cold Streak
+                is_tough_matchup = opponent.goals_against_per_game < 2.9 or "Trap" in str(scenarios)
                 
-                # Check Under 3.5 Lean (The "If not over, then under" logic)
-                elif base_sog < 2.8:
-                    # Clear Under Lean
-                    # ELITE IMMUNITY CHECK for Unders
-                    if "Elite" not in p.status_note and "Volume" not in p.status_note:
-                        picks.append(Pick(game.id, p.name, "SOG", 3.5, "Under", 3, f"Lean: Low Volume (Proj {base_sog:.1f})", 10.0))
-                
-                # Check Points Lean (Standard 0.5 Line)
-                base_pts = p.avg_points
-                if "Efficiency" in str(scenarios): base_pts *= 1.10
-                
-                if base_pts > 0.8:
-                    picks.append(Pick(game.id, p.name, "Points", 0.5, "Over", 3, f"Lean: Points (Proj {base_pts:.1f})", 10.0))
+                if (is_tough_matchup or form["Trend"] == "Cold") and not is_efficiency_favored:
+                     conf = 4
+                     # EDGE: Depth players in Trap games rarely hit 2+ points. Boost confidence.
+                     if "Trap" in str(scenarios) and "Elite" not in p.status_note: conf = 5
+                     picks.append(Pick(game.id, p.name, "Points", 1.5, "Under", conf, f"Ceiling Fade: {opponent.code} limits offense. Betting against multi-point game.", 12.0))
+                     
+            # --- Legacy 1.5 Logic (Disabled but kept for reference) ---
+            # green_light_1_5 = False
+            # ... (Old logic)
+
+            # Rule: Distributor Mode (Strict 1.5 Assist Gate)
+            if p.name == "Connor McDavid" and "RNH" not in p.status_note: 
+                 if green_light_1_5:
+                    picks.append(Pick(game.id, p.name, "Assists", 1.5, "Over", 5, "Distributor Mode: RNH Returns + Green Light.", 10.0))
+                 else:
+                    picks.append(Pick(game.id, p.name, "Assists", 1.5, "Under", 4, "Fade Distributor: 1.5 Assists requires perfect script.", 12.0))
+
+            # Rule: Usage Vacuum
+            # REFINED v3.0.5: Uses Automated Roster Gate result
+            team_obj = game.home_team if p.team == game.home_team.code else game.away_team
+            
+            if team_obj.top_center_out and not p.is_injured and ("Winger" in p.position.name or "Defense" in p.position.name):
+                # Only boost high-volume players
+                if p.avg_sog > 2.0:
+                    rationale = f"Usage Vacuum: Star Player OUT. {p.name} usage spike."
+                    # If this is a Trap Game, we OVERRIDE the Trap Fade
+                    if "Trap Game" in scenarios:
+                        rationale += " + TRAP OVERRIDE (Vacuum)."
+                        # Clear any previous picks for this player (remove the Under)
+                        # Filter existing picks to remove conflicting Unders for this player
+                        picks = [pick for pick in picks if not (pick.player_name == p.name and pick.side == "Under")]
+                        
+                    picks.append(Pick(game.id, p.name, "SOG", 2.5, "Over", 4, rationale, 14.0))
+                    continue # Skip other checks
+            
+            # Rule: Usage Spike (Legacy Manual Check - Keeping as fallback)
+            if "Rantanen OUT" in p.status_note or "Rantanen OUT" in team_obj.name:
+                 if p.name == "Nathan MacKinnon":
+                    picks.append(Pick(game.id, p.name, "SOG", 4.5, "Over", 5, "Usage Spike: Rantanen OUT.", 18.0))
+
+            # Rule: The Heater (General) / Advanced Regression
+            if "Heater" in p.status_note or form["Trend"] == "Heater":
+                 picks.append(Pick(game.id, p.name, "Points", 1.5, "Over", 4, "The Heater: Hot Streak.", 12.0))
+            
+            # Rule: Buy Low (Advanced Stats)
+            if form.get("Buy_Low", False):
+                 picks.append(Pick(game.id, p.name, "Goals", 0.5, "Over", 4, f"Buy Low Alert: High xG ({form['L3_xG']:.2f}) vs Low Goals. Due.", 16.0))
+                 
+            # Rule: Sell High (Advanced Stats) - Strict Unders
+            # green_light_1_5 might be undefined if points logic was skipped or modified
+            # We default it to False
+            green_light_1_5 = locals().get('green_light_1_5', False)
+            
+            if form.get("Sell_High", False) and not green_light_1_5:
+                 picks.append(Pick(game.id, p.name, "Points", 1.5, "Under", 5, f"Regression Fade: Lucky Scoring (High Goals, Low xG {form['L3_xG']:.2f}).", 20.0))
+
+            # Fallback for Force Mode if no pick generated
+            if force_all and not any(pick.player_name == p.name for pick in picks):
+                 # Generate a "Lean" based on simple stats
+                 side = "Under"
+                 if p.avg_sog > 3.0: side = "Over"
+                 picks.append(Pick(game.id, p.name, "SOG", 3.5, side, 1, "Forced Lean: Based on Avg SOG only.", 0.0))
 
         return picks
+    
+    # Placeholder rule methods
     def _rule_siege_anchor(self): pass
     def _rule_usage_vacuum(self): pass
     def _rule_efficiency_fade(self): pass
@@ -1242,7 +1293,7 @@ def parse_game_from_api(game_data: Dict[str, Any], date_str: Optional[str] = Non
         return None
 
 def main():
-    parser = argparse.ArgumentParser(description="NHL Model v3.0.2 - Saves Under Dominance")
+    parser = argparse.ArgumentParser(description="NHL Model v3.1.3 - Restored Hybrid")
     parser.add_argument("--date", type=str, default=datetime.date.today().strftime("%Y-%m-%d"), help="Date to analyze (YYYY-MM-DD)")
     args = parser.parse_args()
 
@@ -1267,10 +1318,10 @@ def main():
             print(f"\nMatchup: {game.id}")
             games.append(game)
 
-    model = NHLModel_v3_0_3()
+    model = NHLModel_Final()
     picks = model.analyze_slate(games)
 
-    print("\n🏆 MASTER PICK BOARD (Model v3.0.3 - Dynamic + Conflict Resolved) 🏆")
+    print("\n🏆 MASTER PICK BOARD (Model v3.1.3 - Restored Hybrid + Fixed) 🏆")
     print(f"Date: {args.date}\n")
     print(f"{'CONF':<6} | {'EV':<6} | {'MATCHUP':<10} | {'PLAYER/TEAM':<20} | {'MARKET':<8} | {'ODDS':<5} | {'RATIONALE'}")
     print("-" * 110)
