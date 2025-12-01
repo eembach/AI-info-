@@ -340,7 +340,7 @@ class NHLScheduleFetcher:
 
 class PlayerFormAnalyzer:
     def analyze_form(self, player: Player, reference_date: Optional[datetime.date] = None) -> Dict[str, Any]:
-        """Calculates L5/L10 averages and ADVANCED STATS (xG, Corsi)."""
+        """Calculates L5/L10 averages, ADVANCED STATS (xG, Corsi), and CONSISTENCY metrics."""
         fetcher = NHLScheduleFetcher()
         stats_engine = AdvancedStatsEngine()
         
@@ -351,7 +351,12 @@ class PlayerFormAnalyzer:
         logs = fetcher.fetch_player_game_log(player.id, season)
         
         if not logs:
-            return {"L5_SOG": 0, "L5_Points": 0, "L5_xG": 0.0, "Trend": "Unknown", "Regression_Risk": False}
+            return {
+                "L5_SOG": 0, "L5_Points": 0, "L5_Goals": 0, 
+                "L3_xG": 0.0, "Trend": "Unknown", "SOG_Trend": "Unknown",
+                "Buy_Low": False, "Sell_High": False,
+                "Consistency_Points": 0.0, "Consistency_SOG": 0.0
+            }
             
         if reference_date:
             try:
@@ -359,11 +364,20 @@ class PlayerFormAnalyzer:
             except ValueError: pass
                 
         l5_games = logs[:5]
+        l20_games = logs[:20] # For consistency check
         
-        # Basic Stats
+        # Basic Stats (L5)
         l5_sog = sum(g.get('shots', 0) for g in l5_games) / len(l5_games) if l5_games else 0
         l5_points = sum(g.get('points', 0) for g in l5_games) / len(l5_games) if l5_games else 0
         l5_goals = sum(g.get('goals', 0) for g in l5_games) / len(l5_games) if l5_games else 0
+        
+        # Consistency Check (Critique 2 Improvement)
+        # Calculate Hit Rate % over L20 games
+        hits_points = sum(1 for g in l20_games if g.get('points', 0) > 0)
+        consistency_points = hits_points / len(l20_games) if l20_games else 0.0
+        
+        hits_sog_3 = sum(1 for g in l20_games if g.get('shots', 0) >= 3)
+        consistency_sog = hits_sog_3 / len(l20_games) if l20_games else 0.0
         
         # Advanced Stats (xG) - Fetch PBP for last 3 games (Optimization: only 3 deep to save time)
         l3_xg_total = 0.0
@@ -413,7 +427,9 @@ class PlayerFormAnalyzer:
             "Trend": trend,
             "SOG_Trend": sog_trend,
             "Buy_Low": buy_low,
-            "Sell_High": sell_high
+            "Sell_High": sell_high,
+            "Consistency_Points": consistency_points,
+            "Consistency_SOG": consistency_sog
         }
 
 class TeamStatDatabase:
@@ -1096,10 +1112,19 @@ class NHLModel_Final:
                 # If proj > 0.9, high chance of 1 point.
                 if proj_pts > 0.85:
                     confidence = 5
-                    if team_gf < 2.6: confidence = 4 # Downgrade if team offense is struggling
                     
-                    rationale = f"Safety Valve: {p.name} proj {proj_pts:.2f} pts. Target Over 0.5."
-                    if confidence < 5: rationale += " (Team Offense Cold)."
+                    # Critique 2 Improvement: Consistency Check
+                    # If consistency < 60% (less than 12/20 hits), downgrade.
+                    consistency = form.get("Consistency_Points", 1.0)
+                    if consistency < 0.60:
+                        confidence = 4 # Downgrade due to lack of consistency
+                        rationale = f"Safety Valve: {p.name} proj {proj_pts:.2f} pts. (Downgraded: Low Consistency {consistency*100:.0f}%)"
+                    else:
+                        rationale = f"Safety Valve: {p.name} proj {proj_pts:.2f} pts. Target Over 0.5."
+                    
+                    if team_gf < 2.6: 
+                        confidence = min(confidence, 4) # Downgrade if team offense is struggling
+                        rationale += " (Team Offense Cold)."
                     
                     picks.append(Pick(game.id, p.name, "Points", 0.5, "Over", confidence, rationale, 10.0))
             
